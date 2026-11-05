@@ -1,46 +1,45 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
-  <PropertyGroup>
-    <TargetFramework>net48</TargetFramework>
-    <AssemblyName>ClaudeBridge</AssemblyName>
-    <RootNamespace>ClaudeBridge</RootNamespace>
-    <LangVersion>latest</LangVersion>
-    <OutputPath>bin\</OutputPath>
-    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
-  </PropertyGroup>
+	<PropertyGroup>
+		<TargetFramework>net10.0-windows</TargetFramework>
+		<AssemblyName>ClaudeBridge</AssemblyName>
+		<RootNamespace>ClaudeBridge</RootNamespace>
+		<LangVersion>latest</LangVersion>
+		<OutputPath>bin\</OutputPath>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+		<UseWindowsForms>true</UseWindowsForms>
+		<RsSdkDir>C:\Program Files (x86)\ABB\RobotStudio 2026\Bin</RsSdkDir>
+	</PropertyGroup>
 
-  <ItemGroup>
-    <Reference Include="ABB.Robotics.RobotStudio">
-      <HintPath>C:\Program Files (x86)\ABB\RobotStudio 2025\Bin\ABB.Robotics.RobotStudio.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="ABB.Robotics.RobotStudio.Stations">
-      <HintPath>C:\Program Files (x86)\ABB\RobotStudio 2025\Bin\ABB.Robotics.RobotStudio.Stations.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="ABB.Robotics.RobotStudio.Controllers">
-      <HintPath>C:\Program Files (x86)\ABB\RobotStudio 2025\Bin\ABB.Robotics.RobotStudio.Controllers.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="ABB.Robotics.Controllers.PC">
-      <HintPath>C:\Program Files (x86)\ABB\RobotStudio 2025\Bin\ABB.Robotics.Controllers.PC.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="ABB.Robotics.Math">
-      <HintPath>C:\Program Files (x86)\ABB\RobotStudio 2025\Bin\ABB.Robotics.Math.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="ABB.Robotics.RobotStudio.Environment">
-      <HintPath>C:\Program Files (x86)\ABB\RobotStudio 2025\Bin\ABB.Robotics.RobotStudio.Environment.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="System.Net.Http" />
-    <Reference Include="System.Net.Http.WebRequest" />
-    <Reference Include="System.Web" />
-    <Reference Include="Newtonsoft.Json">
-      <HintPath>C:\Program Files (x86)\ABB\RobotStudio 2025\Bin\Newtonsoft.Json.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-  </ItemGroup>
+	<ItemGroup>
+		<Reference Include="ABB.Robotics.RobotStudio">
+			<HintPath>$(RsSdkDir)\ABB.Robotics.RobotStudio.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="ABB.Robotics.RobotStudio.Stations">
+			<HintPath>$(RsSdkDir)\ABB.Robotics.RobotStudio.Stations.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="ABB.Robotics.RobotStudio.Controllers">
+			<HintPath>$(RsSdkDir)\ABB.Robotics.RobotStudio.Controllers.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="ABB.Robotics.Controllers.PC">
+			<HintPath>$(RsSdkDir)\ABB.Robotics.Controllers.PC.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="ABB.Robotics.Math">
+			<HintPath>$(RsSdkDir)\ABB.Robotics.Math.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="ABB.Robotics.RobotStudio.Environment">
+			<HintPath>$(RsSdkDir)\ABB.Robotics.RobotStudio.Environment.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+	</ItemGroup>
 
 </Project>

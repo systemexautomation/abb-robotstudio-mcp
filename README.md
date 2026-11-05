@@ -1,10 +1,10 @@
 # ABB RobotStudio MCP Server — LiskinLabs Edition
 
-> **v3.1.0 (Safety-First & Hardened Edition)** — Advanced MCP server for ABB RobotStudio and ABB robot controllers with TcpListener transport, 63 MCP tools, AutoLoad, RAPID syntax validator, pre-simulation safety guards, and path-traversal protection.
+> **v3.1.0 (Safety-First & Hardened Edition)** — Advanced MCP server for ABB RobotStudio and ABB robot controllers with TcpListener transport, 66 MCP tools, AutoLoad, RAPID syntax validator, pre-simulation safety guards, and path-traversal protection.
 
 Model Context Protocol (MCP) server for ABB RobotStudio (desktop application) and ABB robot controllers (OmniCore / IRC5 / Virtual Controllers).
 
-Exposes **63 tools** across two transports:
+Exposes **66 tools** across two transports:
 
 - **`rs_*`** (33 tools) — RobotStudio SDK via TcpListener in-process Add-In. Inspect/edit stations, targets, paths, modules, variables, I/O signals, configs. Drive simulation with safety guards. Capture screenshots.
 - **`rws_*`** (30 tools) — Robot Web Services REST API direct to controller. Motors, program execution, I/O signals, filesystem, mastership, event log, runtime target controller switching.
@@ -91,11 +91,11 @@ curl http://localhost:58080/ping
 
 ---
 
-## 🛠️ Complete Tool Index (63 Tools)
+## 🛠️ Complete Tool Index (66 Tools)
 
 ### SDK Tools (`rs_*`) — 33 tools
 - **Connection & Status:** `rs_ping`, `rs_controller_status`, `rs_check_safety`
-- **Station Management:** `rs_get_station`, `rs_get_station_objects`, `rs_save_station`, `rs_get_screenshot`
+- **Station Management:** `rs_get_station`, `rs_get_station_objects`, `rs_get_object_parts`, `rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_save_station`, `rs_get_screenshot`
 - **RAPID Management:** `rs_get_tasks`, `rs_get_modules`, `rs_read_module`, `rs_write_module`, `rs_validate_rapid`
 - **Variables & Data:** `rs_read_variable`, `rs_write_variable`, `rs_list_variables`
 - **I/O Signals:** `rs_get_io_signals`, `rs_read_io_signal`, `rs_write_io_signal`

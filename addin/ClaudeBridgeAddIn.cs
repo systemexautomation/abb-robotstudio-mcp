@@ -18,6 +18,7 @@ using ABB.Robotics.Controllers.RapidDomain;
 using ABB.Robotics.Controllers.Discovery;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using VirtualController = ABB.Robotics.RobotStudio.Stations.VirtualController;
 
 namespace ClaudeBridge
 {
@@ -83,7 +84,7 @@ namespace ClaudeBridge
         }
 
         // Marshal to UI thread via the Idle event queue
-        private T RunOnUIThread<T>(Func<T> func)
+        private T RunOnUIThread<T>(Func<T> func, int timeoutSeconds = 30)
         {
             T result = default;
             Exception error = null;
@@ -99,8 +100,8 @@ namespace ClaudeBridge
                 });
             }
 
-            if (!done.Wait(TimeSpan.FromSeconds(30)))
-                throw new TimeoutException("UI thread did not respond within 30 seconds");
+            if (!done.Wait(TimeSpan.FromSeconds(timeoutSeconds)))
+                throw new TimeoutException("UI thread did not respond within " + timeoutSeconds + " seconds");
 
             if (error != null)
                 throw new Exception(error.Message, error);
@@ -255,8 +256,10 @@ namespace ClaudeBridge
                     object result;
                     try
                     {
+                        // Geometry analysis of large imported parts can take minutes
+                        int uiTimeout = path == "/station/object/parts" ? 300 : 30;
                         result = RunOnUIThread(() =>
-                            Route(path, method, body, query));
+                            Route(path, method, body, query), uiTimeout);
                     }
                     catch (Exception ex)
                     {
@@ -359,9 +362,14 @@ namespace ClaudeBridge
 
                 // ── Station ───────────────────────────────────
                 case "/station":              return GetStation();
-                case "/station/objects":      return method == "GET" && query["bbox"] == "true"
-                                                    ? GetStationObjectsDetailed()
-                                                    : GetStationObjects();
+                case "/station/objects":      return GetStationObjects(query);
+                case "/station/object/parts": return GetObjectParts(query);
+                case "/station/part/from-body":
+                    if (method != "POST") throw new Exception("POST required");
+                    return CreatePartFromBody(body);
+                case "/station/part/remove-bodies":
+                    if (method != "POST") throw new Exception("POST required");
+                    return RemoveBodiesFromPart(body);
                 case "/station/save":         return SaveStation();
 
                 // ── RAPID ─────────────────────────────────────
@@ -432,12 +440,12 @@ namespace ClaudeBridge
             return s;
         }
 
-        private RsIrc5Controller GetController()
+        private VirtualController GetController()
         {
             var station = GetActiveStation();
-            if (station.Irc5Controllers.Count == 0)
+            if (station.VirtualControllers.Count == 0)
                 throw new Exception("No controller in station");
-            return station.Irc5Controllers[0];
+            return station.VirtualControllers[0];
         }
 
         private Controller ConnectToController()
@@ -478,7 +486,7 @@ namespace ClaudeBridge
             }
         }
 
-        private RsTask FindTask(RsIrc5Controller ctrl, string taskName)
+        private RsTask FindTask(VirtualController ctrl, string taskName)
         {
             var allTasks = ctrl.Tasks.Cast<RsTask>()
                 .Concat(ctrl.NonMotionTasks.Cast<RsTask>())
@@ -513,7 +521,7 @@ namespace ClaudeBridge
         {
             var station = GetActiveStation();
             var ctrls = new List<object>();
-            foreach (RsIrc5Controller c in station.Irc5Controllers)
+            foreach (VirtualController c in station.VirtualControllers)
             {
                 ctrls.Add(new
                 {
@@ -526,112 +534,844 @@ namespace ClaudeBridge
             return new { name = station.Name, controllers = ctrls };
         }
 
-        private object GetStationObjects()
+        // Limits keep responses well under the MCP client's 1 MB cap.
+        private const int DefaultObjectLimit = 200;
+        private const int MaxObjectLimit = 2000;
+        private const int DefaultMaxDepth = 6;
+        private const int MaxMaxDepth = 20;
+
+        private static int ParseIntQuery(NameValueCollection query, string key, int def, int min, int max)
         {
-            var station = GetActiveStation();
-            var objects = new List<object>();
-            CollectObjects(station, objects, 0);
-            return objects;
+            int v;
+            if (!int.TryParse(query[key], out v)) v = def;
+            return Math.Max(min, Math.Min(max, v));
         }
 
-        private void CollectObjects(ProjectObject parent, List<object> list, int depth)
+        private static object Vec3Mm(ABB.Robotics.Math.Vector3 v)
         {
-            foreach (ProjectObject child in parent.Children)
+            return new
             {
-                list.Add(new
-                {
-                    name = child.Name,
-                    type = child.GetType().Name,
-                    depth
-                });
-                if (depth < 4)
-                    CollectObjects(child, list, depth + 1);
+                x_mm = Math.Round(v.x * 1000, 1),
+                y_mm = Math.Round(v.y * 1000, 1),
+                z_mm = Math.Round(v.z * 1000, 1)
+            };
+        }
+
+        private static object BBoxMm(ABB.Robotics.Math.BoundingBox bb)
+        {
+            if (!bb.IsValid()) return null;
+            var min = bb.min; var max = bb.max;
+            return new
+            {
+                minX_mm = Math.Round(min.x * 1000, 1),
+                minY_mm = Math.Round(min.y * 1000, 1),
+                minZ_mm = Math.Round(min.z * 1000, 1),
+                maxX_mm = Math.Round(max.x * 1000, 1),
+                maxY_mm = Math.Round(max.y * 1000, 1),
+                maxZ_mm = Math.Round(max.z * 1000, 1),
+                sizeX_mm = Math.Round((max.x - min.x) * 1000, 1),
+                sizeY_mm = Math.Round((max.y - min.y) * 1000, 1),
+                sizeZ_mm = Math.Round((max.z - min.z) * 1000, 1)
+            };
+        }
+
+        private static ABB.Robotics.Math.BoundingBox Union(ABB.Robotics.Math.BoundingBox a, ABB.Robotics.Math.BoundingBox b)
+        {
+            if (!a.IsValid()) return b;
+            if (!b.IsValid()) return a;
+            var r = a;
+            r.min = new ABB.Robotics.Math.Vector3(Math.Min(a.min.x, b.min.x), Math.Min(a.min.y, b.min.y), Math.Min(a.min.z, b.min.z));
+            r.max = new ABB.Robotics.Math.Vector3(Math.Max(a.max.x, b.max.x), Math.Max(a.max.y, b.max.y), Math.Max(a.max.z, b.max.z));
+            return r;
+        }
+
+        // Adds global position + bounding box of a GraphicComponent to obj (best effort).
+        private static void AddGeometryInfo(GraphicComponent gc, Dictionary<string, object> obj)
+        {
+            try { obj["position"] = Vec3Mm(gc.Transform.GlobalMatrix.Translation); } catch { }
+            try
+            {
+                var bb = BBoxMm(gc.GetBoundingBox(true));
+                if (bb != null) obj["boundingBox"] = bb;
             }
+            catch { }
         }
 
-        private object GetStationObjectsDetailed()
+        private static IEnumerable<ProjectObject> ChildrenOf(ProjectObject po)
+        {
+            // Children covers most objects; GraphicComponents covers groups/smart components.
+            var seen = new HashSet<ProjectObject>();
+            foreach (ProjectObject c in po.Children)
+                if (seen.Add(c)) yield return c;
+            if (po is IHasGraphicComponents hg)
+                foreach (GraphicComponent c in hg.GraphicComponents)
+                    if (seen.Add(c)) yield return c;
+        }
+
+        // GET /station/objects?nameFilter=&limit=&maxDepth=&bbox=true
+        private object GetStationObjects(NameValueCollection query)
         {
             var station = GetActiveStation();
+            var filter = query["nameFilter"];
+            bool bbox = query["bbox"] == "true";
+            int limit = ParseIntQuery(query, "limit", DefaultObjectLimit, 1, MaxObjectLimit);
+            int maxDepth = ParseIntQuery(query, "maxDepth", DefaultMaxDepth, 0, MaxMaxDepth);
+
             var objects = new List<object>();
-            CollectObjectsDetailed(station, objects, 0);
-            return new { stationName = station.Name, objectCount = objects.Count, objects };
-        }
+            int matched = 0;
 
-        private void CollectObjectsDetailed(ProjectObject parent, List<object> list, int depth)
-        {
-            foreach (ProjectObject child in parent.Children)
+            void Walk(ProjectObject parent, string parentPath, int depth)
             {
-                var obj = new Dictionary<string, object>
+                foreach (var child in ChildrenOf(parent))
                 {
-                    ["name"] = child.Name,
-                    ["type"] = child.GetType().Name,
-                    ["depth"] = depth
-                };
-
-                try
-                {
-                    var gc = child as GraphicComponent;
-                    if (gc != null)
+                    var name = child.Name ?? "";
+                    var path = string.IsNullOrEmpty(parentPath) ? name : parentPath + "/" + name;
+                    bool isMatch = string.IsNullOrEmpty(filter)
+                        || name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (isMatch)
                     {
-                        var transform = gc.Transform;
-                        if (transform != null)
+                        matched++;
+                        if (objects.Count < limit)
                         {
-                            try
+                            var obj = new Dictionary<string, object>
                             {
-                                var gmat = TryGetProperty(transform, "GlobalMatrix");
-                                if (gmat != null)
-                                {
-                                    var trans = TryGetProperty(gmat, "Translation");
-                                    if (trans != null)
-                                    {
-                                        obj["position"] = new
-                                        {
-                                            x = Math.Round(GetDoubleProp(trans, "X"), 3),
-                                            y = Math.Round(GetDoubleProp(trans, "Y"), 3),
-                                            z = Math.Round(GetDoubleProp(trans, "Z"), 3)
-                                        };
-                                    }
-                                }
-                            }
-                            catch { }
-                        }
-
-                        var bb = gc.GetBoundingBox(true);
-                        if (bb != null)
-                        {
-                            try
-                            {
-                                var bbMin = TryGetProperty(bb, "Min");
-                                var bbMax = TryGetProperty(bb, "Max");
-                                if (bbMin != null && bbMax != null)
-                                {
-                                    double minX = GetDoubleProp(bbMin, "X"), minY = GetDoubleProp(bbMin, "Y"), minZ = GetDoubleProp(bbMin, "Z");
-                                    double maxX = GetDoubleProp(bbMax, "X"), maxY = GetDoubleProp(bbMax, "Y"), maxZ = GetDoubleProp(bbMax, "Z");
-                                    obj["boundingBox"] = new
-                                    {
-                                        minX_mm = Math.Round(minX * 1000, 1),
-                                        minY_mm = Math.Round(minY * 1000, 1),
-                                        minZ_mm = Math.Round(minZ * 1000, 1),
-                                        maxX_mm = Math.Round(maxX * 1000, 1),
-                                        maxY_mm = Math.Round(maxY * 1000, 1),
-                                        maxZ_mm = Math.Round(maxZ * 1000, 1),
-                                        sizeX_mm = Math.Round((maxX - minX) * 1000, 1),
-                                        sizeY_mm = Math.Round((maxY - minY) * 1000, 1),
-                                        sizeZ_mm = Math.Round((maxZ - minZ) * 1000, 1)
-                                    };
-                                }
-                            }
-                            catch { }
+                                ["name"] = name,
+                                ["type"] = child.GetType().Name,
+                                ["depth"] = depth,
+                                ["path"] = path
+                            };
+                            if (bbox && child is GraphicComponent gc) AddGeometryInfo(gc, obj);
+                            objects.Add(obj);
                         }
                     }
+                    if (depth < maxDepth)
+                        Walk(child, path, depth + 1);
                 }
-                catch { /* bounding box not always available */ }
-
-                list.Add(obj);
-
-                if (depth < 4)
-                    CollectObjectsDetailed(child, list, depth + 1);
             }
+
+            Walk(station, "", 0);
+            return new
+            {
+                stationName = station.Name,
+                nameFilter = filter,
+                maxDepth,
+                limit,
+                matchedCount = matched,
+                returnedCount = objects.Count,
+                truncated = matched > objects.Count,
+                objects
+            };
+        }
+
+        // GET /station/object/parts?name=&maxDepth=&limit=
+        private object GetObjectParts(NameValueCollection query)
+        {
+            var station = GetActiveStation();
+            var name = query["name"];
+            if (string.IsNullOrWhiteSpace(name))
+                throw new Exception("Parameter 'name' is required");
+            int limit = ParseIntQuery(query, "limit", DefaultObjectLimit, 1, MaxObjectLimit);
+            int maxDepth = ParseIntQuery(query, "maxDepth", 3, 0, MaxMaxDepth);
+
+            // Locate target: exact (case-insensitive) match wins, else unique substring match.
+            var exact = new List<Tuple<ProjectObject, string>>();
+            var partial = new List<Tuple<ProjectObject, string>>();
+            void Find(ProjectObject parent, string parentPath, int depth)
+            {
+                foreach (var child in ChildrenOf(parent))
+                {
+                    var n = child.Name ?? "";
+                    var path = string.IsNullOrEmpty(parentPath) ? n : parentPath + "/" + n;
+                    if (n.Equals(name, StringComparison.OrdinalIgnoreCase)) exact.Add(Tuple.Create(child, path));
+                    else if (n.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0) partial.Add(Tuple.Create(child, path));
+                    if (depth < MaxMaxDepth) Find(child, path, depth + 1);
+                }
+            }
+            Find(station, "", 0);
+
+            var candidates = exact.Count > 0 ? exact : partial;
+            if (candidates.Count == 0)
+                throw new Exception("No object whose name matches '" + name + "'");
+            if (candidates.Count > 1)
+                return new
+                {
+                    error = "Ambiguous name '" + name + "': " + candidates.Count + " matches. Use the exact name.",
+                    candidates = candidates.Take(50).Select(c => new { name = c.Item1.Name, type = c.Item1.GetType().Name, path = c.Item2 })
+                };
+
+            var target = candidates[0].Item1;
+            var info = new Dictionary<string, object>
+            {
+                ["name"] = target.Name,
+                ["type"] = target.GetType().Name,
+                ["path"] = candidates[0].Item2
+            };
+
+            var mode = (query["mode"] ?? "tree").ToLowerInvariant();
+            if (mode == "bodies" || mode == "clusters")
+            {
+                if (!(target is Part ap))
+                    throw new Exception("mode=" + mode + " requires a Part; '" + target.Name + "' is " + target.GetType().Name);
+                return AnalyzePartBodies(ap, info, mode, query);
+            }
+            if (mode != "tree")
+                throw new Exception("Unknown mode '" + mode + "'. Use tree, bodies or clusters.");
+            if (target is GraphicComponent tgc) AddGeometryInfo(tgc, info);
+
+            int count = 0;
+            bool truncated = false;
+
+            List<object> DescribeBodies(Part part)
+            {
+                var list = new List<object>();
+                foreach (Body body in part.Bodies)
+                {
+                    if (count >= limit) { truncated = true; break; }
+                    count++;
+                    var b = new Dictionary<string, object>
+                    {
+                        ["name"] = body.Name,
+                        ["kind"] = "Body",
+                        ["bodyType"] = body.BodyType.ToString()
+                    };
+                    try
+                    {
+                        var bb = ABB.Robotics.Math.BoundingBox.Empty;
+                        int faces = 0;
+                        foreach (Face f in body.Faces) { faces++; bb = Union(bb, f.GetBoundingBox(true)); }
+                        b["faceCount"] = faces;
+                        var bbo = BBoxMm(bb);
+                        if (bbo != null) b["boundingBox"] = bbo;
+                    }
+                    catch { }
+                    try { b["volume_dm3"] = Math.Round(body.Volume * 1000, 3); } catch { }
+                    try { b["surfaceArea_m2"] = Math.Round(body.SurfaceArea, 4); } catch { }
+                    list.Add(b);
+                }
+                return list;
+            }
+
+            List<object> Describe(ProjectObject parent, int depth)
+            {
+                var list = new List<object>();
+                foreach (var child in ChildrenOf(parent))
+                {
+                    if (child is Body) continue; // bodies are listed via Part.Bodies
+                    if (count >= limit) { truncated = true; break; }
+                    count++;
+                    var o = new Dictionary<string, object>
+                    {
+                        ["name"] = child.Name,
+                        ["kind"] = child.GetType().Name,
+                        ["depth"] = depth
+                    };
+                    if (child is GraphicComponent gc) AddGeometryInfo(gc, o);
+                    if (child is Part p)
+                    {
+                        try { o["bodyCount"] = p.Bodies.Count; } catch { }
+                        var bodies = DescribeBodies(p);
+                        if (bodies.Count > 0) o["bodies"] = bodies;
+                    }
+                    if (depth < maxDepth)
+                    {
+                        var sub = Describe(child, depth + 1);
+                        if (sub.Count > 0) o["children"] = sub;
+                    }
+                    list.Add(o);
+                }
+                return list;
+            }
+
+            if (target is Part tp)
+            {
+                try { info["bodyCount"] = tp.Bodies.Count; } catch { }
+                info["bodies"] = DescribeBodies(tp);
+            }
+            info["children"] = Describe(target, 0);
+            info["itemCount"] = count;
+            info["truncated"] = truncated;
+            info["note"] = "Coordinates are global, in mm. Body bounding boxes are computed from their faces.";
+            return info;
+        }
+
+        // ── Body analysis of a flattened Part (mode=bodies|clusters) ──────────
+        // Query (lengths in mm):
+        //   region=minX,minY,minZ,maxX,maxY,maxZ  keep only bodies whose bbox intersects it
+        //   clusterTolerance=1                    max gap between bboxes merged into one cluster
+        //   footprints=812.8x863.6;711.2x965.2    XY sizes to look for (orientation-free)
+        //   sizeTolerance=25                      max per-side deviation to call it a match
+        //   candidates=5                          best candidates returned per footprint
+        //   limit=200&offset=0                    paging of the full item list (no footprints)
+
+        private class BoxItem
+        {
+            public double MinX, MinY, MinZ, MaxX, MaxY, MaxZ; // metres, global
+            public int BodyCount, FaceCount;
+            public double Volume; // m3, sum of body volumes
+            public List<int> BodyIndices = new List<int>();
+        }
+
+        private static double ParseDoubleQuery(NameValueCollection query, string key, double def)
+        {
+            double v;
+            return double.TryParse(query[key], System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out v) ? v : def;
+        }
+
+        private static object BoxItemMm(BoxItem b, int index)
+        {
+            double sx = (b.MaxX - b.MinX) * 1000, sy = (b.MaxY - b.MinY) * 1000, sz = (b.MaxZ - b.MinZ) * 1000;
+            return new
+            {
+                index,
+                bodyCount = b.BodyCount,
+                faceCount = b.FaceCount,
+                volume_dm3 = Math.Round(b.Volume * 1000, 3),
+                center = new
+                {
+                    x_mm = Math.Round((b.MinX + b.MaxX) * 500, 1),
+                    y_mm = Math.Round((b.MinY + b.MaxY) * 500, 1),
+                    z_mm = Math.Round((b.MinZ + b.MaxZ) * 500, 1)
+                },
+                boundingBox = new
+                {
+                    minX_mm = Math.Round(b.MinX * 1000, 1), minY_mm = Math.Round(b.MinY * 1000, 1), minZ_mm = Math.Round(b.MinZ * 1000, 1),
+                    maxX_mm = Math.Round(b.MaxX * 1000, 1), maxY_mm = Math.Round(b.MaxY * 1000, 1), maxZ_mm = Math.Round(b.MaxZ * 1000, 1),
+                    sizeX_mm = Math.Round(sx, 1), sizeY_mm = Math.Round(sy, 1), sizeZ_mm = Math.Round(sz, 1)
+                },
+                firstBodyIndices = b.BodyIndices.Take(10)
+            };
+        }
+
+        // ── Per-Part cache of body boxes ─────────────────────────────────────
+        // source=mesh : display tessellation (Part.Mesh → MeshPart.Bodies → MeshBody.GetBoundingBox), fast.
+        // source=faces: exact B-rep faces (Body.Faces → Face.GetBoundingBox(true)), slow on big imports,
+        //               so it runs in time-budgeted slices and resumes on the next call.
+        // source=auto : mesh if available, else faces.
+
+        private class BodyBoxCache
+        {
+            public Part Part;
+            public string Source;
+            public List<BoxItem> Boxes = new List<BoxItem>(); // one slot per body (null = no geometry)
+            public int NextIndex;
+            public bool Done;
+            public object FrameCheck;
+            public int PartBodyCount; // Part.Bodies.Count when built: cache is stale if it changes
+        }
+
+        private static readonly Dictionary<Part, BodyBoxCache> _bodyBoxCache = new Dictionary<Part, BodyBoxCache>();
+
+        private static BoxItem ToBoxItem(ABB.Robotics.Math.BoundingBox bb, int index, int faces, double volume)
+        {
+            var it = new BoxItem
+            {
+                MinX = bb.min.x, MinY = bb.min.y, MinZ = bb.min.z,
+                MaxX = bb.max.x, MaxY = bb.max.y, MaxZ = bb.max.z,
+                BodyCount = 1, FaceCount = faces, Volume = volume
+            };
+            it.BodyIndices.Add(index);
+            return it;
+        }
+
+        private static double CornerDistance(ABB.Robotics.Math.BoundingBox a, ABB.Robotics.Math.BoundingBox b)
+        {
+            return Math.Abs(a.min.x - b.min.x) + Math.Abs(a.min.y - b.min.y) + Math.Abs(a.min.z - b.min.z) +
+                   Math.Abs(a.max.x - b.max.x) + Math.Abs(a.max.y - b.max.y) + Math.Abs(a.max.z - b.max.z);
+        }
+
+        private BodyBoxCache GetBodyBoxes(Part part, string source, int timeBudgetSeconds)
+        {
+            BodyBoxCache c;
+            int currentBodyCount = part.Bodies.Count;
+            if (_bodyBoxCache.TryGetValue(part, out c) && c.PartBodyCount == currentBodyCount && (source == "auto" || source == c.Source))
+            {
+                if (c.Done) return c;
+            }
+            else
+            {
+                c = null;
+                if (source == "auto" || source == "mesh")
+                    c = TryBuildFromMesh(part);
+                if (c == null)
+                {
+                    if (source == "mesh") throw new Exception("No display mesh available for '" + part.Name + "'. Use source=faces.");
+                    c = new BodyBoxCache { Part = part, Source = "faces" };
+                    int n = part.Bodies.Count;
+                    for (int i = 0; i < n; i++) c.Boxes.Add(null);
+                }
+                c.PartBodyCount = currentBodyCount;
+                _bodyBoxCache[part] = c;
+                if (c.Done) return c;
+            }
+
+            // Faces: resume where the previous slice stopped
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            int idx = 0;
+            foreach (Body body in part.Bodies)
+            {
+                if (idx >= c.NextIndex)
+                {
+                    if (sw.Elapsed.TotalSeconds >= timeBudgetSeconds) break;
+                    var bb = ABB.Robotics.Math.BoundingBox.Empty;
+                    int faces = 0;
+                    try { foreach (Face f in body.Faces) { faces++; bb = Union(bb, f.GetBoundingBox(true)); } } catch { }
+                    double vol = 0;
+                    try { vol = body.Volume; } catch { }
+                    if (idx < c.Boxes.Count) c.Boxes[idx] = bb.IsValid() ? ToBoxItem(bb, idx, faces, vol) : null;
+                    c.NextIndex = idx + 1;
+                }
+                idx++;
+            }
+            c.Done = c.NextIndex >= c.Boxes.Count;
+            return c;
+        }
+
+        private BodyBoxCache TryBuildFromMesh(Part part)
+        {
+            MeshPart mp = null;
+            try
+            {
+                var mesh = part.Mesh;
+                if (mesh == null) return null;
+                foreach (var lvl in new[] { DetailLevels.Coarse, DetailLevels.Medium, DetailLevels.Fine, DetailLevels.Default })
+                {
+                    try { mp = mesh[lvl]; } catch { mp = null; }
+                    if (mp != null && mp.Bodies != null && mp.Bodies.Count > 0) break;
+                    mp = null;
+                }
+            }
+            catch { return null; }
+            if (mp == null) return null;
+
+            // Mesh coordinates may be local to the Part: pick the frame that matches the Part's global box
+            var raw = new List<ABB.Robotics.Math.BoundingBox>();
+            var rawUnion = ABB.Robotics.Math.BoundingBox.Empty;
+            var faceCounts = new List<int>();
+            foreach (MeshBody mb in mp.Bodies)
+            {
+                var bb = ABB.Robotics.Math.BoundingBox.Empty;
+                try { bb = mb.GetBoundingBox(); } catch { }
+                raw.Add(bb);
+                int fc = 0; try { fc = mb.Faces.Count; } catch { }
+                faceCounts.Add(fc);
+                if (bb.IsValid()) rawUnion = Union(rawUnion, bb);
+            }
+            if (!rawUnion.IsValid()) return null;
+
+            var global = part.GetBoundingBox(true);
+            var m = part.Transform.GlobalMatrix;
+            var transformedUnion = rawUnion.TransformAffine(m);
+            double dRaw = CornerDistance(rawUnion, global), dTrans = CornerDistance(transformedUnion, global);
+            bool useTransform = dTrans < dRaw;
+
+            var c = new BodyBoxCache
+            {
+                Part = part,
+                Source = "mesh",
+                FrameCheck = new
+                {
+                    meshBodyCount = raw.Count,
+                    appliedPartTransform = useTransform,
+                    deviationFromPartBox_mm = Math.Round(Math.Min(dRaw, dTrans) * 1000, 1),
+                    note = "Sum of the 6 corner deviations between the union of mesh boxes and Part.GetBoundingBox(true). Near 0 = frame is right."
+                }
+            };
+            for (int i = 0; i < raw.Count; i++)
+            {
+                var bb = raw[i];
+                if (!bb.IsValid()) { c.Boxes.Add(null); continue; }
+                if (useTransform) bb = bb.TransformAffine(m);
+                c.Boxes.Add(ToBoxItem(bb, i, faceCounts[i], 0));
+            }
+            c.NextIndex = c.Boxes.Count;
+            c.Done = true;
+            return c;
+        }
+
+        private object AnalyzePartBodies(Part part, Dictionary<string, object> info, string mode, NameValueCollection query)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            int limit = ParseIntQuery(query, "limit", DefaultObjectLimit, 1, MaxObjectLimit);
+            int offset = ParseIntQuery(query, "offset", 0, 0, int.MaxValue);
+            int perFootprint = ParseIntQuery(query, "candidates", 5, 1, 50);
+            double clusterTol = ParseDoubleQuery(query, "clusterTolerance", 1) / 1000.0;
+            double sizeTol = ParseDoubleQuery(query, "sizeTolerance", 25);
+
+            double[] region = null;
+            if (!string.IsNullOrWhiteSpace(query["region"]))
+            {
+                var parts = query["region"].Split(',');
+                if (parts.Length != 6) throw new Exception("region must be minX,minY,minZ,maxX,maxY,maxZ (mm)");
+                region = parts.Select(p => double.Parse(p.Trim(), System.Globalization.CultureInfo.InvariantCulture) / 1000.0).ToArray();
+            }
+
+            // 1. Global bounding box of every body (cached per Part; see GetBodyBoxes)
+            var cache = GetBodyBoxes(part, (query["source"] ?? "auto").ToLowerInvariant(),
+                                     ParseIntQuery(query, "timeBudget", 20, 1, 240));
+            info["geometrySource"] = cache.Source;
+            if (cache.FrameCheck != null) info["meshFrameCheck"] = cache.FrameCheck;
+            if (!cache.Done)
+            {
+                info["status"] = "incomplete";
+                info["progress"] = new { processed = cache.NextIndex, total = cache.Boxes.Count };
+                info["hint"] = "Body boxes are computed in slices to keep RobotStudio responsive. Call again with the same name to continue; progress is kept.";
+                info["timing_s"] = Math.Round(sw.Elapsed.TotalSeconds, 1);
+                return info;
+            }
+
+            var items = new List<BoxItem>();
+            int skippedNoGeometry = 0, outsideRegion = 0;
+            foreach (var cb in cache.Boxes)
+            {
+                if (cb == null) { skippedNoGeometry++; continue; }
+                if (region != null && (cb.MaxX < region[0] || cb.MinX > region[3] || cb.MaxY < region[1] ||
+                                       cb.MinY > region[4] || cb.MaxZ < region[2] || cb.MinZ > region[5]))
+                { outsideRegion++; continue; }
+                // Copy: clustering mutates/aggregates items, the cache must stay intact
+                var it = new BoxItem
+                {
+                    MinX = cb.MinX, MinY = cb.MinY, MinZ = cb.MinZ, MaxX = cb.MaxX, MaxY = cb.MaxY, MaxZ = cb.MaxZ,
+                    BodyCount = 1, FaceCount = cb.FaceCount, Volume = cb.Volume
+                };
+                it.BodyIndices.AddRange(cb.BodyIndices);
+                items.Add(it);
+            }
+            double bboxSeconds = sw.Elapsed.TotalSeconds;
+
+            // 2. Optional clustering: union-find over bboxes closer than clusterTol (sweep on X)
+            if (mode == "clusters" && items.Count > 1)
+            {
+                int n = items.Count;
+                var parent = Enumerable.Range(0, n).ToArray();
+                int FindRoot(int i) { while (parent[i] != i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; }
+                var order = Enumerable.Range(0, n).OrderBy(i => items[i].MinX).ToArray();
+                var active = new List<int>();
+                foreach (var i in order)
+                {
+                    var a = items[i];
+                    active.RemoveAll(j => items[j].MaxX + clusterTol < a.MinX);
+                    foreach (var j in active)
+                    {
+                        var b = items[j];
+                        if (a.MinY <= b.MaxY + clusterTol && b.MinY <= a.MaxY + clusterTol &&
+                            a.MinZ <= b.MaxZ + clusterTol && b.MinZ <= a.MaxZ + clusterTol)
+                        {
+                            int ra = FindRoot(i), rb = FindRoot(j);
+                            if (ra != rb) parent[ra] = rb;
+                        }
+                    }
+                    active.Add(i);
+                }
+                var groups = new Dictionary<int, BoxItem>();
+                for (int i = 0; i < n; i++)
+                {
+                    var r = FindRoot(i); var a = items[i];
+                    if (!groups.TryGetValue(r, out var g))
+                    {
+                        g = new BoxItem { MinX = a.MinX, MinY = a.MinY, MinZ = a.MinZ, MaxX = a.MaxX, MaxY = a.MaxY, MaxZ = a.MaxZ };
+                        groups[r] = g;
+                    }
+                    g.MinX = Math.Min(g.MinX, a.MinX); g.MinY = Math.Min(g.MinY, a.MinY); g.MinZ = Math.Min(g.MinZ, a.MinZ);
+                    g.MaxX = Math.Max(g.MaxX, a.MaxX); g.MaxY = Math.Max(g.MaxY, a.MaxY); g.MaxZ = Math.Max(g.MaxZ, a.MaxZ);
+                    g.BodyCount += a.BodyCount; g.FaceCount += a.FaceCount; g.Volume += a.Volume;
+                    g.BodyIndices.AddRange(a.BodyIndices);
+                }
+                items = groups.Values.ToList();
+            }
+
+            // Largest first: makes the paged list readable
+            items = items.OrderByDescending(b => (b.MaxX - b.MinX) * (b.MaxY - b.MinY)).ToList();
+
+            info["mode"] = mode;
+            info["bodyCount"] = cache.Boxes.Count;
+            info["bodiesWithoutGeometry"] = skippedNoGeometry;
+            if (region != null) info["bodiesOutsideRegion"] = outsideRegion;
+            info["itemCount"] = items.Count;
+            if (mode == "clusters") info["clusterTolerance_mm"] = clusterTol * 1000;
+
+            // 3. Footprint search, or plain paged list
+            var footprintsArg = query["footprints"];
+            if (!string.IsNullOrWhiteSpace(footprintsArg))
+            {
+                var results = new List<object>();
+                foreach (var fp in footprintsArg.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var dims = fp.ToLowerInvariant().Split('x');
+                    if (dims.Length != 2) throw new Exception("footprint '" + fp + "' must be WIDTHxLENGTH in mm");
+                    double d1 = double.Parse(dims[0].Trim(), System.Globalization.CultureInfo.InvariantCulture);
+                    double d2 = double.Parse(dims[1].Trim(), System.Globalization.CultureInfo.InvariantCulture);
+                    double tSmall = Math.Min(d1, d2), tLarge = Math.Max(d1, d2);
+
+                    var scored = items.Select((b, idx) =>
+                    {
+                        double sx = (b.MaxX - b.MinX) * 1000, sy = (b.MaxY - b.MinY) * 1000;
+                        double err = Math.Max(Math.Abs(Math.Min(sx, sy) - tSmall), Math.Abs(Math.Max(sx, sy) - tLarge));
+                        return new { idx, b, err };
+                    }).OrderBy(s => s.err).Take(perFootprint).ToList();
+
+                    results.Add(new
+                    {
+                        footprint_mm = fp,
+                        matchCount = items.Count(b =>
+                        {
+                            double sx = (b.MaxX - b.MinX) * 1000, sy = (b.MaxY - b.MinY) * 1000;
+                            return Math.Max(Math.Abs(Math.Min(sx, sy) - tSmall), Math.Abs(Math.Max(sx, sy) - tLarge)) <= sizeTol;
+                        }),
+                        candidates = scored.Select(s => new
+                        {
+                            footprintError_mm = Math.Round(s.err, 1),
+                            withinTolerance = s.err <= sizeTol,
+                            item = BoxItemMm(s.b, s.idx)
+                        })
+                    });
+                }
+                info["sizeTolerance_mm"] = sizeTol;
+                info["footprintSearch"] = results;
+            }
+            else
+            {
+                info["offset"] = offset;
+                info["returnedCount"] = Math.Max(0, Math.Min(limit, items.Count - offset));
+                info["truncated"] = offset + limit < items.Count;
+                info["items"] = items.Skip(offset).Take(limit).Select((b, k) => BoxItemMm(b, offset + k)).ToList();
+            }
+
+            info["timing_s"] = new { bodyBoxes = Math.Round(bboxSeconds, 1), total = Math.Round(sw.Elapsed.TotalSeconds, 1) };
+            info["note"] = "Global coordinates in mm, axis-aligned boxes. Items sorted by XY area (largest first); 'index' refers to that order, firstBodyIndices to Part.Bodies order.";
+            return info;
+        }
+
+        // ── POST /station/part/from-body ──────────────────────────────────────
+        // Body: {"sourcePart":"...","bodyIndex":8,"name":"Palette_28x38"}
+        // Copies one body (index as reported by rs_get_object_parts mode=bodies, source=mesh) into a new
+        // Part. The new Part's frame is set on a lower corner of the body's box: X along the long side,
+        // Z up, Y completing a right-handed frame, the box lying in +X/+Y. Geometry stays in place.
+        // Wrapped in one undo step (Ctrl+Z in RobotStudio removes it).
+        private object CreatePartFromBody(string body)
+        {
+            var station = GetActiveStation();
+            var req = JObject.Parse(body ?? "{}");
+            var sourceName = (string)req["sourcePart"];
+            var newName = (string)req["name"];
+            var idxToken = req["bodyIndex"];
+            if (string.IsNullOrWhiteSpace(sourceName) || string.IsNullOrWhiteSpace(newName) || idxToken == null)
+                throw new Exception("Required: sourcePart, bodyIndex, name");
+            int bodyIndex = (int)idxToken;
+
+            if (station.GraphicComponents.Contains(newName))
+                throw new Exception("An object named '" + newName + "' already exists in the station");
+
+            // Source Part: exact (case-insensitive) name among all station objects
+            Part part = null;
+            void Find(ProjectObject parent, int depth)
+            {
+                foreach (var child in ChildrenOf(parent))
+                {
+                    if (part != null) return;
+                    if (child is Part p && (p.Name ?? "").Equals(sourceName, StringComparison.OrdinalIgnoreCase)) { part = p; return; }
+                    if (depth < MaxMaxDepth) Find(child, depth + 1);
+                }
+            }
+            Find(station, 0);
+            if (part == null) throw new Exception("No Part named '" + sourceName + "'");
+
+            // Expected box (global) from the mesh cache, same indexing as rs_get_object_parts
+            var cache = GetBodyBoxes(part, "mesh", 20);
+            if (bodyIndex < 0 || bodyIndex >= cache.Boxes.Count || cache.Boxes[bodyIndex] == null)
+                throw new Exception("bodyIndex " + bodyIndex + " has no geometry (0.." + (cache.Boxes.Count - 1) + ")");
+            var box = cache.Boxes[bodyIndex];
+
+            // Resolve the B-rep Body behind that mesh body
+            Body src = null;
+            var mp = GetMeshPart(part);
+            try { src = mp?.Bodies[bodyIndex].Body; } catch { }
+            if (src == null) src = part.Bodies[bodyIndex];
+
+            // Safety: the Body's exact box must match the mesh box before we copy anything
+            var exact = ABB.Robotics.Math.BoundingBox.Empty;
+            foreach (Face f in src.Faces) exact = Union(exact, f.GetBoundingBox(true));
+            if (!exact.IsValid()) throw new Exception("Body " + bodyIndex + " has no exact geometry");
+            double dev = new[] {
+                Math.Abs(exact.min.x - box.MinX), Math.Abs(exact.min.y - box.MinY), Math.Abs(exact.min.z - box.MinZ),
+                Math.Abs(exact.max.x - box.MaxX), Math.Abs(exact.max.y - box.MaxY), Math.Abs(exact.max.z - box.MaxZ)
+            }.Max() * 1000;
+            if (dev > 5)
+                throw new Exception("Body/mesh mismatch for index " + bodyIndex + " (" + Math.Round(dev, 1) + " mm). Nothing created.");
+
+            // Target frame on a lower corner of the exact box
+            double sx = exact.max.x - exact.min.x, sy = exact.max.y - exact.min.y;
+            ABB.Robotics.Math.Vector3 xAxis, yAxis, origin;
+            var zAxis = new ABB.Robotics.Math.Vector3(0, 0, 1);
+            // Square within 1 mm (float noise): keep X along station X
+            if (sx >= sy - 0.001)
+            {
+                xAxis = new ABB.Robotics.Math.Vector3(1, 0, 0);
+                yAxis = new ABB.Robotics.Math.Vector3(0, 1, 0);
+                origin = new ABB.Robotics.Math.Vector3(exact.min.x, exact.min.y, exact.min.z);
+            }
+            else
+            {
+                // Long side along station Y: X=+Y, Y=-X, corner at (maxX, minY) keeps the box in +X/+Y
+                xAxis = new ABB.Robotics.Math.Vector3(0, 1, 0);
+                yAxis = new ABB.Robotics.Math.Vector3(-1, 0, 0);
+                origin = new ABB.Robotics.Math.Vector3(exact.max.x, exact.min.y, exact.min.z);
+            }
+            var frame = new ABB.Robotics.Math.Matrix4(xAxis, yAxis, zAxis, origin);
+
+            var bodyGlobal = src.Transform.GlobalMatrix;
+            var undo = Project.UndoContext;
+            undo?.BeginUndoStep("ClaudeBridge: create " + newName);
+            Part created;
+            try
+            {
+                var copy = (Body)src.Copy();
+                created = new Part { Name = newName };
+                station.GraphicComponents.Add(created);
+                created.Bodies.Add(copy);
+                created.Transform.GlobalMatrix = frame;
+                copy.Transform.GlobalMatrix = bodyGlobal; // keep geometry where it was
+            }
+            finally
+            {
+                undo?.EndUndoStep();
+            }
+
+            // Verify: new part's global box must coincide with the source body's box
+            var nb = created.GetBoundingBox(true);
+            double placeDev = nb.IsValid() ? new[] {
+                Math.Abs(nb.min.x - exact.min.x), Math.Abs(nb.min.y - exact.min.y), Math.Abs(nb.min.z - exact.min.z),
+                Math.Abs(nb.max.x - exact.max.x), Math.Abs(nb.max.y - exact.max.y), Math.Abs(nb.max.z - exact.max.z)
+            }.Max() * 1000 : double.NaN;
+
+            var g = created.Transform.GlobalMatrix;
+            return new
+            {
+                success = true,
+                name = created.Name,
+                sourcePart = part.Name,
+                bodyIndex,
+                frame = new
+                {
+                    origin = Vec3Mm(g.Translation),
+                    xAxis = new { x = Math.Round(g.x.x, 4), y = Math.Round(g.x.y, 4), z = Math.Round(g.x.z, 4) },
+                    yAxis = new { x = Math.Round(g.y.x, 4), y = Math.Round(g.y.y, 4), z = Math.Round(g.y.z, 4) },
+                    zAxis = new { x = Math.Round(g.z.x, 4), y = Math.Round(g.z.y, 4), z = Math.Round(g.z.z, 4) }
+                },
+                size_mm = new
+                {
+                    alongX = Math.Round(Math.Max(sx, sy) * 1000, 1),
+                    alongY = Math.Round(Math.Min(sx, sy) * 1000, 1),
+                    alongZ = Math.Round((exact.max.z - exact.min.z) * 1000, 1)
+                },
+                boundingBox = BBoxMm(nb),
+                placementDeviation_mm = Math.Round(placeDev, 2),
+                note = "The original body is still part of the source Part (not removed). Undo with Ctrl+Z in RobotStudio."
+            };
+        }
+
+        private static MeshPart GetMeshPart(Part part)
+        {
+            try
+            {
+                var mesh = part.Mesh;
+                if (mesh == null) return null;
+                foreach (var lvl in new[] { DetailLevels.Coarse, DetailLevels.Medium, DetailLevels.Fine, DetailLevels.Default })
+                {
+                    MeshPart mp = null;
+                    try { mp = mesh[lvl]; } catch { }
+                    if (mp != null && mp.Bodies != null && mp.Bodies.Count > 0) return mp;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        // ── POST /station/part/remove-bodies ──────────────────────────────────
+        // Body: {"sourcePart":"...","bodyIndices":[0,1],"expectFootprints":["965.2x965.2"],"sizeTolerance":1}
+        // Removes bodies (indices as reported by rs_get_object_parts, source=mesh) from a Part.
+        // All-or-nothing: if any index is invalid or (when expectFootprints is given) its XY box does not
+        // match one of the footprints, nothing is removed. One undo step.
+        private object RemoveBodiesFromPart(string body)
+        {
+            var station = GetActiveStation();
+            var req = JObject.Parse(body ?? "{}");
+            var sourceName = (string)req["sourcePart"];
+            var indices = req["bodyIndices"]?.Select(t => (int)t).Distinct().OrderBy(i => i).ToList();
+            if (string.IsNullOrWhiteSpace(sourceName) || indices == null || indices.Count == 0)
+                throw new Exception("Required: sourcePart, bodyIndices");
+            double sizeTol = req["sizeTolerance"] != null ? (double)req["sizeTolerance"] : 1.0;
+            var footprints = (req["expectFootprints"] as JArray)?.Select(t =>
+            {
+                var d = ((string)t).ToLowerInvariant().Split('x');
+                double a = double.Parse(d[0].Trim(), System.Globalization.CultureInfo.InvariantCulture);
+                double b = double.Parse(d[1].Trim(), System.Globalization.CultureInfo.InvariantCulture);
+                return new[] { Math.Min(a, b), Math.Max(a, b) };
+            }).ToList();
+
+            Part part = null;
+            void Find(ProjectObject parent, int depth)
+            {
+                foreach (var child in ChildrenOf(parent))
+                {
+                    if (part != null) return;
+                    if (child is Part p && (p.Name ?? "").Equals(sourceName, StringComparison.OrdinalIgnoreCase)) { part = p; return; }
+                    if (depth < MaxMaxDepth) Find(child, depth + 1);
+                }
+            }
+            Find(station, 0);
+            if (part == null) throw new Exception("No Part named '" + sourceName + "'");
+
+            var cache = GetBodyBoxes(part, "mesh", 20);
+            var mp = GetMeshPart(part);
+            int countBefore = part.Bodies.Count;
+
+            // Resolve and check everything before touching the station
+            var toRemove = new List<Body>();
+            var report = new List<object>();
+            foreach (var idx in indices)
+            {
+                if (idx < 0 || idx >= cache.Boxes.Count || cache.Boxes[idx] == null)
+                    throw new Exception("bodyIndex " + idx + " has no geometry. Nothing removed.");
+                var box = cache.Boxes[idx];
+                double sx = (box.MaxX - box.MinX) * 1000, sy = (box.MaxY - box.MinY) * 1000;
+                double small = Math.Min(sx, sy), large = Math.Max(sx, sy);
+                if (footprints != null && !footprints.Any(f => Math.Abs(small - f[0]) <= sizeTol && Math.Abs(large - f[1]) <= sizeTol))
+                    throw new Exception("bodyIndex " + idx + " is " + Math.Round(sx, 1) + " x " + Math.Round(sy, 1) +
+                                        " mm, not one of the expected footprints. Nothing removed.");
+                Body b = null;
+                try { b = mp?.Bodies[idx].Body; } catch { }
+                if (b == null) throw new Exception("bodyIndex " + idx + ": no B-rep body behind the mesh body. Nothing removed.");
+                toRemove.Add(b);
+                report.Add(new { bodyIndex = idx, sizeX_mm = Math.Round(sx, 1), sizeY_mm = Math.Round(sy, 1),
+                                 minX_mm = Math.Round(box.MinX * 1000, 1), minY_mm = Math.Round(box.MinY * 1000, 1), minZ_mm = Math.Round(box.MinZ * 1000, 1) });
+            }
+
+            var undo = Project.UndoContext;
+            undo.BeginUndoStep("ClaudeBridge: remove " + toRemove.Count + " bodies from " + part.Name);
+            int removed = 0;
+            try
+            {
+                foreach (var b in toRemove)
+                    if (part.Bodies.Remove(b)) removed++;
+            }
+            finally
+            {
+                undo.EndUndoStep();
+            }
+
+            _bodyBoxCache.Remove(part); // indices changed
+            return new
+            {
+                success = removed == toRemove.Count,
+                sourcePart = part.Name,
+                requested = toRemove.Count,
+                removed,
+                bodyCountBefore = countBefore,
+                bodyCountAfter = part.Bodies.Count,
+                bodies = report,
+                note = "Body indices of this Part have changed: re-run rs_get_object_parts before using indices again. Undo with Ctrl+Z. Station not saved."
+            };
         }
 
         private object SaveStation()

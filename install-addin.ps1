@@ -3,7 +3,7 @@
 # Requires Administrator permissions to install into RobotStudio Bin\Addins.
 
 param(
-    [string]$RobotStudioVersion = "2025"
+    [string]$RobotStudioVersion = "2026"
 )
 
 $addinName = "ClaudeBridge"
@@ -28,14 +28,21 @@ if (-not (Test-Path "$rsBase\Bin\ABB.Robotics.RobotStudio.dll")) {
     exit 1
 }
 
-# 3. Deploy to Bin\Addins and Common Files\Addins
+# 3. RobotStudio keeps the loaded add-in DLL locked: refuse to copy while it runs
+if (Get-Process -Name "RobotStudio" -ErrorAction SilentlyContinue) {
+    Write-Error "RobotStudio is running and locks ClaudeBridge.dll. Close RobotStudio, then run this script again."
+    exit 1
+}
+
+# 4. Deploy to Bin\Addins and Common Files\Addins
 foreach ($target in @($dest, $commonDest)) {
     try {
         New-Item -ItemType Directory -Path $target -Force -ErrorAction Stop | Out-Null
         Copy-Item "$source\ClaudeBridge.dll" $target -Force -ErrorAction Stop
         Copy-Item "$PSScriptRoot\addin\ClaudeBridge.rsaddin" $target -Force -ErrorAction Stop
     } catch {
-        Write-Error "Cannot copy files to: $target. Run PowerShell as Administrator."
+        Write-Error ("Cannot copy files to: $target`n  Cause: " + $_.Exception.Message +
+            "`n  Hints: close RobotStudio (it locks ClaudeBridge.dll) and run PowerShell as Administrator.")
         exit 1
     }
 }
