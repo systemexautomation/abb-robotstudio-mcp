@@ -36,6 +36,12 @@ function err(e: any, context?: string) {
   };
 }
 
+// The add-in decodes queries with Uri.UnescapeDataString, which does not turn "+" into a space.
+// URLSearchParams encodes a literal "+" as %2B, so every remaining "+" is a space.
+function toBridgeQuery(q: URLSearchParams): string {
+  return q.toString().replace(/\+/g, "%20");
+}
+
 // ── RAPID Validation Helper ──────────────────────────────────
 
 function validateOrReject(code: string, skipValidation?: boolean): { valid: true } | { valid: false; error: any } {
@@ -117,11 +123,81 @@ server.tool("rs_get_station", "Get active RobotStudio station info (name, contro
   async () => { try { return ok(await bridge("/station")); } catch (e: any) { return err(e); } }
 );
 
-server.tool("rs_get_station_objects", "List all objects in the station (robots, tools, smart components). Set bbox=true for bounding box and position data.",
-  { bbox: z.boolean().optional().describe("Include bounding box and position (default: false)") },
-  async ({ bbox }) => { try {
-    const path = bbox ? "/station/objects?bbox=true" : "/station/objects";
-    return ok(await bridge(path));
+server.tool("rs_get_station_objects", "List objects in the station (robots, tools, parts, smart components) with their tree path. Use nameFilter to search by name and limit to cap the result size. Set bbox=true for global position and bounding box (mm). Response reports matchedCount and truncated.",
+  {
+    bbox: z.boolean().optional().describe("Include global position and bounding box in mm (default: false)"),
+    nameFilter: z.string().optional().describe("Case-insensitive substring the object name must contain"),
+    limit: z.number().int().min(1).max(2000).optional().describe("Max objects returned (default: 200)"),
+    maxDepth: z.number().int().min(0).max(20).optional().describe("Max tree depth to search (default: 6)"),
+  },
+  async ({ bbox, nameFilter, limit, maxDepth }) => { try {
+    const q = new URLSearchParams();
+    if (bbox) q.set("bbox", "true");
+    if (nameFilter) q.set("nameFilter", nameFilter);
+    if (limit !== undefined) q.set("limit", String(limit));
+    if (maxDepth !== undefined) q.set("maxDepth", String(maxDepth));
+    const qs = toBridgeQuery(q);
+    return ok(await bridge(`/station/objects${qs ? "?" + qs : ""}`, "GET", undefined, 30000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_get_object_parts", "Inspect the internal elements of one station object: child components, parts and their bodies, each with name, global position and bounding box (mm). Bodies also report face count, volume and surface area. Use it to tell sub-elements apart (e.g. several pallets inside one layout part). Read-only.",
+  {
+    name: z.string().describe("Object name: exact match (case-insensitive) is preferred, otherwise a unique substring"),
+    maxDepth: z.number().int().min(0).max(20).optional().describe("Max depth of children to describe (default: 3)"),
+    limit: z.number().int().min(1).max(2000).optional().describe("Max elements described / items listed (default: 200)"),
+    mode: z.enum(["tree", "bodies", "clusters"]).optional().describe(
+      "tree (default): children and bodies. bodies: one global box per body of a Part. " +
+      "clusters: bodies whose boxes touch (within clusterTolerance) are merged into one item — use it for flattened CAD imports"),
+    offset: z.number().int().min(0).optional().describe("bodies/clusters: skip the first N items of the list (paging)"),
+    region: z.array(z.number()).length(6).optional().describe("bodies/clusters: [minX,minY,minZ,maxX,maxY,maxZ] in mm; only bodies intersecting it are kept"),
+    clusterTolerance: z.number().min(0).max(1000).optional().describe("clusters: max gap in mm between merged boxes (default: 1)"),
+    footprints: z.array(z.string()).optional().describe("bodies/clusters: XY sizes to look for, e.g. ['812.8x863.6'] (mm, orientation-free). Returns best candidates per footprint instead of the full list"),
+    sizeTolerance: z.number().min(0).optional().describe("Max per-side deviation in mm for a footprint match (default: 25)"),
+    candidates: z.number().int().min(1).max(50).optional().describe("Candidates returned per footprint (default: 5)"),
+    source: z.enum(["auto", "mesh", "faces"]).optional().describe(
+      "bodies/clusters geometry: mesh = display tessellation (fast), faces = exact B-rep (slow, computed in slices: " +
+      "if status is 'incomplete', call again to continue). auto (default) = mesh if available. Boxes are cached per Part"),
+    timeBudget: z.number().int().min(1).max(240).optional().describe("faces source: seconds of work per call (default: 20)"),
+  },
+  async ({ name, maxDepth, limit, mode, offset, region, clusterTolerance, footprints, sizeTolerance, candidates, source, timeBudget }) => { try {
+    const q = new URLSearchParams({ name });
+    if (maxDepth !== undefined) q.set("maxDepth", String(maxDepth));
+    if (limit !== undefined) q.set("limit", String(limit));
+    if (mode) q.set("mode", mode);
+    if (offset !== undefined) q.set("offset", String(offset));
+    if (region) q.set("region", region.join(","));
+    if (clusterTolerance !== undefined) q.set("clusterTolerance", String(clusterTolerance));
+    if (footprints?.length) q.set("footprints", footprints.join(";"));
+    if (sizeTolerance !== undefined) q.set("sizeTolerance", String(sizeTolerance));
+    if (candidates !== undefined) q.set("candidates", String(candidates));
+    if (source) q.set("source", source);
+    if (timeBudget !== undefined) q.set("timeBudget", String(timeBudget));
+    // Analysing every body of a large imported Part can take minutes (add-in allows 300 s)
+    return ok(await bridge(`/station/object/parts?${toBridgeQuery(q)}`, "GET", undefined, 310000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_create_part_from_body", "MODIFIES THE STATION. Copy one body of a Part (index from rs_get_object_parts mode=bodies) into a new Part whose frame is on a lower corner of the body: X along the long side, Z up, body in +X/+Y. Geometry stays in place; the source body is not removed. One undo step (Ctrl+Z in RobotStudio). Does not save the station.",
+  {
+    sourcePart: z.string().describe("Exact name of the source Part"),
+    bodyIndex: z.number().int().min(0).describe("Body index as reported by rs_get_object_parts (firstBodyIndices, source=mesh)"),
+    name: z.string().min(1).describe("Name of the new Part (must not already exist)"),
+  },
+  async ({ sourcePart, bodyIndex, name }) => { try {
+    return ok(await bridge("/station/part/from-body", "POST", { sourcePart, bodyIndex, name }, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_remove_part_bodies", "MODIFIES THE STATION. Remove bodies from a Part (indices from rs_get_object_parts mode=bodies, source=mesh). All-or-nothing: with expectFootprints, every body must match one footprint or nothing is removed. One undo step (Ctrl+Z). Body indices change afterwards. Does not save the station.",
+  {
+    sourcePart: z.string().describe("Exact name of the Part"),
+    bodyIndices: z.array(z.number().int().min(0)).min(1).describe("Body indices to remove"),
+    expectFootprints: z.array(z.string()).optional().describe("Safety check: XY sizes each body must match, e.g. ['965.2x965.2'] (mm, orientation-free)"),
+    sizeTolerance: z.number().min(0).optional().describe("Tolerance in mm for expectFootprints (default: 1)"),
+  },
+  async ({ sourcePart, bodyIndices, expectFootprints, sizeTolerance }) => { try {
+    return ok(await bridge("/station/part/remove-bodies", "POST", { sourcePart, bodyIndices, expectFootprints, sizeTolerance }, 60000));
   } catch (e: any) { return err(e); } }
 );
 
@@ -781,7 +857,7 @@ async function main() {
   console.error("  SDK Bridge: " + BRIDGE_URL + " (TcpListener, no admin rights)");
   console.error("  RWS:        " + getRwsUrl() + " (runtime-switchable via rws_set_controller_url)");
   console.error("  Safety:     RAPID validation + pre-simulation error guard");
-  console.error("  Tools:      rs_* (33) + rws_* (30) = 63 total");
+  console.error("  Tools:      rs_* (36) + rws_* (30) = 66 total");
   console.error("  RULES:      NEVER run simulation if RAPID errors exist");
 }
 
