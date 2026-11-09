@@ -1,15 +1,17 @@
 # ABB RobotStudio MCP Server — LiskinLabs Edition
 
-> **v3.1.0 (Safety-First & Hardened Edition)** — Advanced MCP server for ABB RobotStudio and ABB robot controllers with TcpListener transport, 66 MCP tools, AutoLoad, RAPID syntax validator, pre-simulation safety guards, and path-traversal protection.
+> **v3.1.0 (Safety-First & Hardened Edition)** — Advanced MCP server for ABB RobotStudio and ABB robot controllers with TcpListener transport, 72 MCP tools, AutoLoad, RAPID syntax validator, pre-simulation safety guards, and path-traversal protection.
 
 Model Context Protocol (MCP) server for ABB RobotStudio (desktop application) and ABB robot controllers (OmniCore / IRC5 / Virtual Controllers).
 
-Exposes **66 tools** across two transports:
+Exposes **72 tools** across two transports:
 
-- **`rs_*`** (33 tools) — RobotStudio SDK via TcpListener in-process Add-In. Inspect/edit stations, targets, paths, modules, variables, I/O signals, configs. Drive simulation with safety guards. Capture screenshots.
+- **`rs_*`** (42 tools) — RobotStudio SDK via TcpListener in-process Add-In. Inspect/edit stations, targets, paths, modules, variables, I/O signals, configs. Drive simulation with safety guards. Capture screenshots.
 - **`rws_*`** (30 tools) — Robot Web Services REST API direct to controller. Motors, program execution, I/O signals, filesystem, mastership, event log, runtime target controller switching.
 
-Tested with: **ABB RobotStudio 2025 + Virtual Controller (IRC5 / OmniCore)** on Windows 11 x64.
+Tested with: **ABB RobotStudio 2026 (26.2) + Virtual Controller (RobotWare 7)** on Windows 11 x64.
+
+> **Installation guide (French): [INSTALLATION.md](INSTALLATION.md)** — prerequisites, build, add-in install, Claude Desktop / Claude Code configuration, troubleshooting.
 
 ---
 
@@ -19,7 +21,7 @@ Tested with: **ABB RobotStudio 2025 + Virtual Controller (IRC5 / OmniCore)** on 
 |---|---|---|
 | HTTP Transport | `HttpListener` — requires `netsh urlacl` (Admin) | **`TcpListener`** — zero admin rights required |
 | Tool Count | 50 | **63** (+13 new tools) |
-| Add-In Installation | Manual per-session "Load Add-In" | **AutoLoad** (user-level `Documents\RobotStudio\Addins`) |
+| Add-In Installation | Manual per-session "Load Add-In" | **AutoLoad** (`Bin\Addins` of the RobotStudio install, administrator rights needed once) |
 | RAPID Validation | None (silent syntax failures) | ✅ **`rs_validate_rapid`** (structural AST block check) |
 | Safety Guard | None (sim starts blindly) | ✅ **`rs_check_safety`** + pre-simulation error block |
 | Path Traversal Defense | None | ✅ **`validateControllerPath`** ($SYSTEM protection, `..` filter) |
@@ -51,13 +53,13 @@ dotnet build addin/ClaudeBridge.csproj -c Release
 
 ### 2. Install Add-In to RobotStudio
 
-```powershell
-# Standard installation (installs to Documents\RobotStudio\Addins — NO ADMIN RIGHTS NEEDED):
-powershell -ExecutionPolicy Bypass -File install-addin.ps1
+Close RobotStudio completely first (it locks the DLL), then, in an **administrator** PowerShell:
 
-# Optional system-wide install (requires Administrator elevation):
-powershell -ExecutionPolicy Bypass -File install-addin.ps1 -System
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-addin.ps1 -RobotStudioVersion "2026"
 ```
+
+The script copies `ClaudeBridge.dll` and `ClaudeBridge.rsaddin` to `C:\Program Files (x86)\ABB\RobotStudio 2026\Bin\Addins\ClaudeBridge` and `C:\Program Files (x86)\Common Files\ABB\RobotStudio\Addins\ClaudeBridge`.
 
 ### 3. Configure MCP Client
 
@@ -71,7 +73,7 @@ Add to your MCP client config (`.mcp.json` or `claude_desktop_config.json`):
       "args": ["C:/Projects/01_Robotics/abb-robotstudio-mcp/dist/index.js"],
       "env": {
         "ABB_BRIDGE_URL": "http://localhost:58080",
-        "ABB_RWS_URL": "http://localhost:80",
+        "ABB_RWS_URL": "https://127.0.0.1:80",
         "ABB_RWS_USER": "Default User",
         "ABB_RWS_PASS": "robotics"
       }
@@ -79,6 +81,8 @@ Add to your MCP client config (`.mcp.json` or `claude_desktop_config.json`):
   }
 }
 ```
+
+The RobotStudio 2026 virtual controller serves Robot Web Services over **HTTPS** (self-signed certificate, Basic authentication). The self-signed certificate is accepted only for `127.0.0.1` / `localhost` / `::1`.
 
 ### 4. Launch & Verify
 
@@ -91,11 +95,11 @@ curl http://localhost:58080/ping
 
 ---
 
-## 🛠️ Complete Tool Index (66 Tools)
+## 🛠️ Complete Tool Index (72 Tools)
 
-### SDK Tools (`rs_*`) — 33 tools
+### SDK Tools (`rs_*`) — 42 tools
 - **Connection & Status:** `rs_ping`, `rs_controller_status`, `rs_check_safety`
-- **Station Management:** `rs_get_station`, `rs_get_station_objects`, `rs_get_object_parts`, `rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_save_station`, `rs_get_screenshot`
+- **Station Management:** `rs_get_station`, `rs_get_station_logic`, `rs_get_station_objects`, `rs_get_object_parts`, `rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`, `rs_edit_station_logic`, `rs_get_smartcomponent_library`, `rs_list_config_signals`, `rs_create_config_signals`, `rs_save_station`, `rs_get_screenshot`
 - **RAPID Management:** `rs_get_tasks`, `rs_get_modules`, `rs_read_module`, `rs_write_module`, `rs_validate_rapid`
 - **Variables & Data:** `rs_read_variable`, `rs_write_variable`, `rs_list_variables`
 - **I/O Signals:** `rs_get_io_signals`, `rs_read_io_signal`, `rs_write_io_signal`

@@ -123,6 +123,24 @@ server.tool("rs_get_station", "Get active RobotStudio station info (name, contro
   async () => { try { return ok(await bridge("/station")); } catch (e: any) { return err(e); } }
 );
 
+server.tool("rs_get_station_logic", "Read-only view of the Station Logic: station-level I/O signals, I/O connections and property bindings; every SmartComponent with its properties, signals, internal connections/bindings and child components; the RAPID work objects (wobjdata) of every task, with user and object frames as placed in the station; and the station frames (Paths & Targets > Frames). Poses: global position (mm) and Euler ZYX (deg).",
+  {
+    component: z.string().optional().describe("Only SmartComponents whose name contains this (case-insensitive). Station Logic is always returned"),
+    properties: z.boolean().optional().describe("Include SmartComponent properties (default: true)"),
+    frames: z.boolean().optional().describe("Include work objects and station frames (default: true)"),
+    frameFilter: z.string().optional().describe("Only work objects and frames whose name contains this, e.g. 'Frame_Place_'"),
+  },
+  async ({ component, properties, frames, frameFilter }) => { try {
+    const q = new URLSearchParams();
+    if (component) q.set("component", component);
+    if (properties === false) q.set("properties", "false");
+    if (frames === false) q.set("frames", "false");
+    if (frameFilter) q.set("frameFilter", frameFilter);
+    const qs = toBridgeQuery(q);
+    return ok(await bridge(`/station/logic${qs ? "?" + qs : ""}`, "GET", undefined, 30000));
+  } catch (e: any) { return err(e); } }
+);
+
 server.tool("rs_get_station_objects", "List objects in the station (robots, tools, parts, smart components) with their tree path. Use nameFilter to search by name and limit to cap the result size. Set bbox=true for global position and bounding box (mm). Response reports matchedCount and truncated.",
   {
     bbox: z.boolean().optional().describe("Include global position and bounding box in mm (default: false)"),
@@ -198,6 +216,63 @@ server.tool("rs_remove_part_bodies", "MODIFIES THE STATION. Remove bodies from a
   },
   async ({ sourcePart, bodyIndices, expectFootprints, sizeTolerance }) => { try {
     return ok(await bridge("/station/part/remove-bodies", "POST", { sourcePart, bodyIndices, expectFootprints, sizeTolerance }, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_set_part_frame", "MODIFIES THE STATION. Move a Part's local frame to a new pose without moving its geometry (bodies keep their global pose). Pose in station coordinates: origin in mm, xAxis and zAxis as perpendicular direction vectors; Y = Z x X. One undo step (Ctrl+Z). Does not save the station.",
+  {
+    name: z.string().describe("Exact name of the Part"),
+    origin: z.array(z.number()).length(3).describe("New frame origin [x,y,z] in mm, station coordinates"),
+    xAxis: z.array(z.number()).length(3).describe("New X axis direction [x,y,z], station coordinates"),
+    zAxis: z.array(z.number()).length(3).describe("New Z axis direction [x,y,z], perpendicular to xAxis"),
+  },
+  async ({ name, origin, xAxis, zAxis }) => { try {
+    return ok(await bridge("/station/part/set-frame", "POST", { name, origin, xAxis, zAxis }, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_get_smartcomponent_library", "List the built-in SmartComponents (Source, Sink, LinearMover2, Attacher, LogicGate, Timer...) that rs_edit_station_logic can create with op=create + library.", {},
+  async () => { try { return ok(await bridge("/station/logic/library")); } catch (e: any) { return err(e); } }
+);
+
+const logicOp = z.object({
+  op: z.enum(["create", "delete", "rename", "setVisible", "setProperty", "addProperty", "removeProperty", "addSignal", "removeSignal", "connect", "disconnect", "bind", "unbind"]),
+}).passthrough();
+
+server.tool("rs_edit_station_logic",
+  "MODIFIES THE STATION. Edit the Station Logic with a list of operations executed in order, as ONE undo step (Ctrl+Z). If one operation fails the call stops, the components it created are removed, but changes already made to pre-existing components may remain (check with rs_get_station_logic). Does not save the station. " +
+  "Paths are SmartComponent names separated by '/' (e.g. 'Box Manager/BoxCopy'); '' = the station itself. Operations: " +
+  "{op:'create', parent?:path, name, library?:'Source'|... (see rs_get_smartcomponent_library) | copyOf?:path (copy of an existing component, keeps its properties) } (neither = empty SmartComponent); " +
+  "{op:'delete', path}; {op:'rename', path, newName}; {op:'setVisible', name, visible}; " +
+  "{op:'setProperty', path, property, value, unit?:'mm'|'deg'|'m'|'rad'|'s'} (unit converts to SI for Double/Vector3; value for object properties = name or path of the object; Vector3 = [x,y,z]); " +
+  "{op:'addProperty', path, name, type:'Double'|'Boolean'|'Int32'|'String'|'Vector3'|'GraphicComponent'|'IHasTransform'|'IAttachableChild'|'ProjectObject'|'Part'|full type name, value?, description?}; {op:'removeProperty', path, name}; {op:'addSignal', path?, name, type:'DigitalInput'|'DigitalOutput'|'AnalogInput'|'AnalogOutput'|'DigitalGroupInput'|'DigitalGroupOutput', autoReset?}; {op:'removeSignal', path?, name}; " +
+  "{op:'connect'|'disconnect', container?:path, source, sourceSignal, target, targetSignal, allowCycle?} (source/target = child name, '(self)' for the container, '(Station Logic)', or a controller name at station level); " +
+  "{op:'bind'|'unbind', container?:path, source, sourceProperty, target, targetProperty}. Read the result with rs_get_station_logic.",
+  { ops: z.array(logicOp).min(1).describe("Operations, executed in order") },
+  async ({ ops }) => { try {
+    return ok(await bridge("/station/logic/edit", "POST", { ops }, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_list_config_signals", "List the I/O signals defined in the live controller configuration (EIO_SIGNAL), with type, access and device.",
+  { nameFilter: z.string().optional().describe("Case-insensitive substring of the signal name") },
+  async ({ nameFilter }) => { try {
+    const q = nameFilter ? `?nameFilter=${encodeURIComponent(nameFilter)}` : "";
+    return ok(await bridge(`/controller/config/signals${q}`));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_create_config_signals",
+  "MODIFIES THE CONTROLLER CONFIGURATION. Create I/O signals (EIO_SIGNAL) in the live configuration of the virtual controller. Only missing signals are created; existing ones are never changed. A controller restart is usually required afterwards.",
+  {
+    signals: z.array(z.object({
+      name: z.string(),
+      type: z.enum(["DI", "DO", "AI", "AO", "GI", "GO"]).optional().describe("Default DO"),
+      access: z.string().optional().describe("Default 'All'"),
+    })).min(1),
+  },
+  async ({ signals }) => { try {
+    return ok(await bridge("/controller/config/signals", "POST", { signals }, 60000));
   } catch (e: any) { return err(e); } }
 );
 
@@ -480,12 +555,12 @@ server.tool("rws_set_controller_url", "Switch RWS target controller at runtime (
 server.tool("rws_controller_status", "Get controller state via RWS (opmode, motors, RAPID execution)", {},
   async () => { try {
     const [panel, opmode, exec] = await Promise.all([
-      rws("/rw/panel/ctrlstate"),
+      rws("/rw/panel/ctrl-state").catch(() => rws("/rw/panel/ctrlstate")), // ctrl-state on RobotWare 8
       rws("/rw/panel/opmode"),
       rws("/rw/rapid/execution"),
     ]);
     return ok({
-      controllerState: rwsExtract(panel.body, "ctrlstate"),
+      controllerState: rwsExtract(panel.body, "ctrlstate") || rwsExtract(panel.body, "ctrl-state"),
       operatingMode: rwsExtract(opmode.body, "opmode"),
       executionState: rwsExtract(exec.body, "ctrlexecstate"),
       cycle: rwsExtract(exec.body, "cycle"),
@@ -575,8 +650,18 @@ server.tool("rws_read_module", "Read RAPID module text via RWS",
   { task: z.string(), module: z.string() },
   async ({ task, module }) => { try {
     const r = await rws(`/rw/rapid/tasks/${task}/modules/${module}/text`);
-    const text = rwsExtract(r.body, "module-text") || r.body;
-    return ok({ task, module, text });
+    let text = rwsExtract(r.body, "module-text");
+    if (!text) {
+      // RobotWare 7 answers with metadata only: the module text sits in a temporary file
+      // on the controller (e.g. /TEMP/pusres.123) that must be downloaded separately.
+      const filePath = rwsExtract(r.body, "file-path");
+      const m = /^\/?(TEMP|HOME|SYSTEM)\/(.+)$/i.exec(filePath);
+      if (m) {
+        const file = await rws(`/fileservice/${encodeURIComponent(`$${m[1]!.toUpperCase()}/${m[2]}`)}`);
+        text = file.body;
+      }
+    }
+    return ok({ task, module, text: text || r.body });
   } catch (e: any) { return err(e); } }
 );
 
@@ -857,7 +942,7 @@ async function main() {
   console.error("  SDK Bridge: " + BRIDGE_URL + " (TcpListener, no admin rights)");
   console.error("  RWS:        " + getRwsUrl() + " (runtime-switchable via rws_set_controller_url)");
   console.error("  Safety:     RAPID validation + pre-simulation error guard");
-  console.error("  Tools:      rs_* (36) + rws_* (30) = 66 total");
+  console.error("  Tools:      rs_* (42) + rws_* (30) = 72 total");
   console.error("  RULES:      NEVER run simulation if RAPID errors exist");
 }
 

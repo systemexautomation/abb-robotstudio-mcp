@@ -3,7 +3,7 @@
 ## 📌 Project Overview
 - **Repository:** `LiskinLabs/abb-robotstudio-mcp`
 - **Tech Stack:** TypeScript (Node.js 20+), Model Context Protocol (MCP SDK), C# (.NET 4.8 RobotStudio Add-In).
-- **Purpose:** Full-featured MCP server providing 66 tools for controlling and inspecting ABB RobotStudio via Robot Web Services (RWS), RobotStudio SDK, and TcpListener Add-In.
+- **Purpose:** Full-featured MCP server providing 72 tools for controlling and inspecting ABB RobotStudio via Robot Web Services (RWS), RobotStudio SDK, and TcpListener Add-In.
 - **Current Version:** v3.1.0
 
 ---

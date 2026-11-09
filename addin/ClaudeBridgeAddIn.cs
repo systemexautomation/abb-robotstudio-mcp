@@ -22,7 +22,7 @@ using VirtualController = ABB.Robotics.RobotStudio.Stations.VirtualController;
 
 namespace ClaudeBridge
 {
-    public class ClaudeBridgeAddIn
+    public partial class ClaudeBridgeAddIn
     {
         private TcpListener _listener;
         private CancellationTokenSource _cts;
@@ -370,6 +370,14 @@ namespace ClaudeBridge
                 case "/station/part/remove-bodies":
                     if (method != "POST") throw new Exception("POST required");
                     return RemoveBodiesFromPart(body);
+                case "/station/part/set-frame":
+                    if (method != "POST") throw new Exception("POST required");
+                    return SetPartFrame(body);
+                case "/station/logic":        return GetStationLogic(query);
+                case "/station/logic/edit":
+                    if (method != "POST") throw new Exception("POST required");
+                    return EditStationLogic(body);
+                case "/station/logic/library": return GetSmartComponentLibrary();
                 case "/station/save":         return SaveStation();
 
                 // ── RAPID ─────────────────────────────────────
@@ -390,6 +398,8 @@ namespace ClaudeBridge
 
                 // ── Controller ────────────────────────────────
                 case "/controller/status":    return GetControllerStatus();
+                case "/controller/config/signals":
+                    return method == "GET" ? ListConfigSignals(query) : CreateConfigSignals(body);
 
                 // ── Simulation ────────────────────────────────
                 case "/simulation/start":     return StartSimulation();
@@ -1374,6 +1384,278 @@ namespace ClaudeBridge
             };
         }
 
+        // ── GET /station/logic?component=&properties=true&frames=true&frameFilter= ─
+        // Read-only view of the Station Logic (station-level signals, I/O connections, property
+        // bindings), of every SmartComponent (properties, signals, internal connections/bindings,
+        // child components) and of the station frames (Paths & Targets > Frames).
+
+        private static string ObjName(ProjectObject po, Station station)
+        {
+            if (po == null) return null;
+            if (ReferenceEquals(po, station)) return "(Station Logic)";
+            return string.IsNullOrEmpty(po.Name) ? "(" + po.GetType().Name + ")" : po.Name;
+        }
+
+        private static string ValueText(object v)
+        {
+            if (v == null) return null;
+            if (v is ProjectObject po) return po.Name + " (" + po.GetType().Name + ")";
+            if (v is double d) return Math.Round(d, 6).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            var s = Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture);
+            return s != null && s.Length > 300 ? s.Substring(0, 300) + "…" : s;
+        }
+
+        private static List<object> DescribeSignals(IOSignalCollection signals)
+        {
+            var list = new List<object>();
+            foreach (IOSignal s in signals)
+                list.Add(new { name = s.Name, type = s.SignalType.ToString(), isInput = s.IsInput, value = ValueText(s.Value), autoReset = s.AutoReset });
+            return list;
+        }
+
+        private static List<object> DescribeConnections(IOConnectionCollection conns, Station station)
+        {
+            var list = new List<object>();
+            foreach (IOConnection c in conns)
+                list.Add(new
+                {
+                    source = ObjName(c.SourceObject, station) ?? c.SourceObjectName,
+                    sourceSignal = c.SourceSignal,
+                    target = ObjName(c.TargetObject, station) ?? c.TargetObjectName,
+                    targetSignal = c.TargetSignal,
+                    allowCycle = c.AllowCycle
+                });
+            return list;
+        }
+
+        private static List<object> DescribeBindings(PropertyBindingCollection bindings, Station station)
+        {
+            var list = new List<object>();
+            foreach (PropertyBinding b in bindings)
+                list.Add(new
+                {
+                    source = ObjName(b.SourceObject, station) ?? b.SourceObjectName,
+                    sourceProperty = b.SourceProperty,
+                    target = ObjName(b.TargetObject, station) ?? b.TargetObjectName,
+                    targetProperty = b.TargetProperty
+                });
+            return list;
+        }
+
+        private object GetStationLogic(NameValueCollection query)
+        {
+            var station = GetActiveStation();
+            var componentFilter = query["component"];
+            bool withProps = query["properties"] != "false";
+            bool withFrames = query["frames"] != "false";
+            var frameFilter = query["frameFilter"];
+
+            var components = new List<object>();
+            void Walk(ProjectObject parent, string parentPath, int depth)
+            {
+                foreach (var child in ChildrenOf(parent))
+                {
+                    if (!(child is SmartComponent sc)) { continue; }
+                    var path = string.IsNullOrEmpty(parentPath) ? sc.Name : parentPath + "/" + sc.Name;
+                    bool include = string.IsNullOrEmpty(componentFilter)
+                        || (sc.Name ?? "").IndexOf(componentFilter, StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (include)
+                    {
+                        var o = new Dictionary<string, object>
+                        {
+                            ["name"] = sc.Name,
+                            ["path"] = path,
+                            ["typeName"] = sc.TypeDisplayName,
+                            ["description"] = sc.Description
+                        };
+                        if (!string.IsNullOrEmpty(sc.CodeBehindLocation)) o["codeBehind"] = sc.CodeBehindLocation;
+                        if (withProps)
+                        {
+                            var props = new List<object>();
+                            foreach (DynamicProperty p in sc.Properties)
+                                props.Add(new { name = p.Name, type = p.ValueType?.Name, value = p.DisplayValue ?? ValueText(p.Value), readOnly = p.ReadOnly });
+                            o["properties"] = props;
+                        }
+                        o["signals"] = DescribeSignals(sc.IOSignals);
+                        if (sc.Connections.Count > 0) o["connections"] = DescribeConnections(sc.Connections, station);
+                        if (sc.Bindings.Count > 0) o["bindings"] = DescribeBindings(sc.Bindings, station);
+                        var kids = new List<string>();
+                        foreach (GraphicComponent g in sc.GraphicComponents) kids.Add(g.Name + " (" + g.GetType().Name + ")");
+                        if (kids.Count > 0) o["children"] = kids;
+                        components.Add(o);
+                    }
+                    if (depth < 8) Walk(sc, path, depth + 1); // nested smart components
+                }
+            }
+            Walk(station, "", 0);
+
+            var result = new Dictionary<string, object>
+            {
+                ["stationName"] = station.Name,
+                ["stationLogic"] = new
+                {
+                    signals = DescribeSignals(station.IOSignals),
+                    connections = DescribeConnections(station.Connections, station),
+                    bindings = DescribeBindings(station.Bindings, station)
+                },
+                ["smartComponents"] = components
+            };
+
+            if (withFrames)
+            {
+                // RAPID work objects (wobjdata), as RobotStudio places them in the station
+                object Pose(Transform t)
+                {
+                    try
+                    {
+                        var m = t.GlobalMatrix;
+                        var e = m.EulerZYX;
+                        return new
+                        {
+                            position = Vec3Mm(m.Translation),
+                            eulerZYX_deg = new
+                            {
+                                rx = Math.Round(e.x * 180 / Math.PI, 3),
+                                ry = Math.Round(e.y * 180 / Math.PI, 3),
+                                rz = Math.Round(e.z * 180 / Math.PI, 3)
+                            },
+                            xAxis = new { x = Math.Round(m.x.x, 4), y = Math.Round(m.x.y, 4), z = Math.Round(m.x.z, 4) }
+                        };
+                    }
+                    catch { return null; }
+                }
+                var wobjs = new List<object>();
+                foreach (VirtualController vc in station.VirtualControllers)
+                {
+                    var tasks = vc.Tasks.Cast<RsTask>().Concat(vc.NonMotionTasks.Cast<RsTask>());
+                    foreach (var task in tasks)
+                        foreach (var d in task.DataDeclarations)
+                        {
+                            if (!(d is RsWorkObject wo)) continue;
+                            if (!string.IsNullOrEmpty(frameFilter) && (wo.Name ?? "").IndexOf(frameFilter, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                            wobjs.Add(new
+                            {
+                                name = wo.Name,
+                                controller = vc.Name,
+                                task = task.Name,
+                                module = wo.ModuleName,
+                                robotHold = wo.RobotHold,
+                                userFrameProgrammed = wo.UserFrameProgrammed,
+                                userFrameMechanicalUnit = wo.UserFrameMechanicalUnit,
+                                userFrame = Pose(wo.UserFrame),
+                                objectFrame = Pose(wo.ObjectFrame)
+                            });
+                        }
+                }
+                result["workObjects"] = wobjs;
+
+                var frames = new List<object>();
+                foreach (Frame f in station.Frames)
+                {
+                    if (!string.IsNullOrEmpty(frameFilter) && (f.Name ?? "").IndexOf(frameFilter, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    var fo = new Dictionary<string, object> { ["name"] = f.Name };
+                    try
+                    {
+                        var m = f.Transform.GlobalMatrix;
+                        fo["position"] = Vec3Mm(m.Translation);
+                        var e = m.EulerZYX;
+                        fo["eulerZYX_deg"] = new
+                        {
+                            rx = Math.Round(e.x * 180 / Math.PI, 3),
+                            ry = Math.Round(e.y * 180 / Math.PI, 3),
+                            rz = Math.Round(e.z * 180 / Math.PI, 3)
+                        };
+                    }
+                    catch { }
+                    frames.Add(fo);
+                }
+                result["stationFrames"] = frames;
+            }
+            return result;
+        }
+
+        // ── POST /station/part/set-frame ──────────────────────────────────────
+        // Body: {"name":"Palette_28x38","origin":[x,y,z],"xAxis":[x,y,z],"zAxis":[x,y,z]}  (mm, station frame)
+        // Moves the Part's local frame to the given pose WITHOUT moving its geometry (bodies are
+        // re-placed at their previous global pose). Y = Z x X. One undo step.
+        private object SetPartFrame(string body)
+        {
+            var station = GetActiveStation();
+            var req = JObject.Parse(body ?? "{}");
+            var name = (string)req["name"];
+            if (string.IsNullOrWhiteSpace(name)) throw new Exception("Required: name, origin, xAxis, zAxis");
+
+            ABB.Robotics.Math.Vector3 Vec(string key, double scale)
+            {
+                var a = req[key] as JArray;
+                if (a == null || a.Count != 3) throw new Exception(key + " must be [x,y,z]");
+                return new ABB.Robotics.Math.Vector3((double)a[0] * scale, (double)a[1] * scale, (double)a[2] * scale);
+            }
+            var origin = Vec("origin", 0.001);
+            var xAxis = Vec("xAxis", 1).Normalized();
+            var zAxis = Vec("zAxis", 1).Normalized();
+            if (Math.Abs(xAxis.Dot(zAxis)) > 1e-6)
+                throw new Exception("xAxis and zAxis must be perpendicular");
+            var yAxis = zAxis.Cross(xAxis);
+            var frame = new ABB.Robotics.Math.Matrix4(xAxis, yAxis, zAxis, origin);
+
+            Part part = null;
+            void Find(ProjectObject parent, int depth)
+            {
+                foreach (var child in ChildrenOf(parent))
+                {
+                    if (part != null) return;
+                    if (child is Part p && (p.Name ?? "").Equals(name, StringComparison.OrdinalIgnoreCase)) { part = p; return; }
+                    if (depth < MaxMaxDepth) Find(child, depth + 1);
+                }
+            }
+            Find(station, 0);
+            if (part == null) throw new Exception("No Part named '" + name + "'");
+
+            var before = part.GetBoundingBox(true);
+            var bodies = part.Bodies.Cast<Body>().ToList();
+            var poses = bodies.Select(b => b.Transform.GlobalMatrix).ToList();
+
+            var undo = Project.UndoContext;
+            undo.BeginUndoStep("ClaudeBridge: set frame of " + part.Name);
+            try
+            {
+                part.Transform.GlobalMatrix = frame;
+                for (int i = 0; i < bodies.Count; i++)
+                    bodies[i].Transform.GlobalMatrix = poses[i]; // geometry stays where it was
+            }
+            finally
+            {
+                undo.EndUndoStep();
+            }
+
+            var after = part.GetBoundingBox(true);
+            double dev = (before.IsValid() && after.IsValid()) ? new[] {
+                Math.Abs(after.min.x - before.min.x), Math.Abs(after.min.y - before.min.y), Math.Abs(after.min.z - before.min.z),
+                Math.Abs(after.max.x - before.max.x), Math.Abs(after.max.y - before.max.y), Math.Abs(after.max.z - before.max.z)
+            }.Max() * 1000 : double.NaN;
+
+            var g = part.Transform.GlobalMatrix;
+            var e = g.EulerZYX;
+            return new
+            {
+                success = true,
+                name = part.Name,
+                frame = new
+                {
+                    origin = Vec3Mm(g.Translation),
+                    xAxis = new { x = Math.Round(g.x.x, 4), y = Math.Round(g.x.y, 4), z = Math.Round(g.x.z, 4) },
+                    yAxis = new { x = Math.Round(g.y.x, 4), y = Math.Round(g.y.y, 4), z = Math.Round(g.y.z, 4) },
+                    zAxis = new { x = Math.Round(g.z.x, 4), y = Math.Round(g.z.y, 4), z = Math.Round(g.z.z, 4) },
+                    eulerZYX_deg = new { rx = Math.Round(e.x * 180 / Math.PI, 3), ry = Math.Round(e.y * 180 / Math.PI, 3), rz = Math.Round(e.z * 180 / Math.PI, 3) }
+                },
+                bodyCount = bodies.Count,
+                boundingBox = BBoxMm(after),
+                geometryDeviation_mm = Math.Round(dev, 2),
+                note = "Geometry is unchanged if geometryDeviation_mm is ~0. Undo with Ctrl+Z. Station not saved."
+            };
+        }
+
         private object SaveStation()
         {
             var station = GetActiveStation();
@@ -1534,16 +1816,22 @@ namespace ClaudeBridge
                         var searchRoot = Path.Combine(diskCtrl.SystemPath, "HOME");
                         if (Directory.Exists(searchRoot))
                         {
-                            foreach (var pattern in new[] { "*.mod", "*.sys", "*.sysx", "*.pgf" })
+                            // Several copies may exist in sub-folders: take the most recent one
+                            var newest = new[] { "*.mod", "*.modx", "*.sys", "*.sysx", "*.pgf" }
+                                .SelectMany(p => Directory.GetFiles(searchRoot, p, SearchOption.AllDirectories))
+                                .Where(f => Path.GetFileNameWithoutExtension(f).Equals(moduleName, StringComparison.OrdinalIgnoreCase))
+                                .OrderByDescending(f => File.GetLastWriteTime(f))
+                                .FirstOrDefault();
+                            if (newest != null)
                             {
-                                foreach (var f in Directory.GetFiles(searchRoot, pattern, SearchOption.AllDirectories))
+                                return new
                                 {
-                                    if (Path.GetFileNameWithoutExtension(f).Equals(moduleName, StringComparison.OrdinalIgnoreCase))
-                                    {
-                                        string text = File.ReadAllText(f);
-                                        return new { task = taskName, module = moduleName, type = "program", text };
-                                    }
-                                }
+                                    task = taskName, module = moduleName, type = "program",
+                                    text = File.ReadAllText(newest),
+                                    source = "disk: " + newest,
+                                    sourceModified = File.GetLastWriteTime(newest).ToString("yyyy-MM-dd HH:mm:ss"),
+                                    note = "Read from the virtual controller's disk copy; it may be older than the module loaded in the controller."
+                                };
                             }
                         }
                         // Strategy 4: Controller filesystem search
