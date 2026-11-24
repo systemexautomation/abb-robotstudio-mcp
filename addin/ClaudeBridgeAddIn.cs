@@ -373,6 +373,15 @@ namespace ClaudeBridge
                 case "/station/part/set-frame":
                     if (method != "POST") throw new Exception("POST required");
                     return SetPartFrame(body);
+                case "/station/part/create-solid":
+                    if (method != "POST") throw new Exception("POST required");
+                    return CreateSolidPart(body);
+                case "/station/part/modify-solid":
+                    if (method != "POST") throw new Exception("POST required");
+                    return ModifySolidPart(body);
+                case "/station/part/transform":
+                    if (method != "POST") throw new Exception("POST required");
+                    return TransformPart(body);
                 case "/station/logic":        return GetStationLogic(query);
                 case "/station/logic/edit":
                     if (method != "POST") throw new Exception("POST required");
@@ -432,6 +441,9 @@ namespace ClaudeBridge
 
                 // ── Collision Detection ───────────────────────
                 case "/collision/check":      return CheckCollisions();
+                case "/collision/set":
+                    if (method != "POST") throw new Exception("POST required");
+                    return CreateCollisionSet(body);
 
                 // ── Screenshot ────────────────────────────────
                 case "/screenshot":           return TakeScreenshot(body);

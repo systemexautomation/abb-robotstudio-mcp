@@ -99,7 +99,7 @@ curl http://localhost:58080/ping
 
 ### SDK Tools (`rs_*`) — 42 tools
 - **Connection & Status:** `rs_ping`, `rs_controller_status`, `rs_check_safety`
-- **Station Management:** `rs_get_station`, `rs_get_station_logic`, `rs_get_station_objects`, `rs_get_object_parts`, `rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`, `rs_edit_station_logic`, `rs_get_smartcomponent_library`, `rs_list_config_signals`, `rs_create_config_signals`, `rs_save_station`, `rs_get_screenshot`
+- **Station Management:** `rs_get_station`, `rs_get_station_logic`, `rs_get_station_objects`, `rs_get_object_parts`, `rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`, `rs_create_solid_part`, `rs_modify_solid_part`, `rs_transform_part`, `rs_edit_station_logic`, `rs_get_smartcomponent_library`, `rs_list_config_signals`, `rs_create_config_signals`, `rs_save_station`, `rs_get_screenshot`
 - **RAPID Management:** `rs_get_tasks`, `rs_get_modules`, `rs_read_module`, `rs_write_module`, `rs_validate_rapid`
 - **Variables & Data:** `rs_read_variable`, `rs_write_variable`, `rs_list_variables`
 - **I/O Signals:** `rs_get_io_signals`, `rs_read_io_signal`, `rs_write_io_signal`

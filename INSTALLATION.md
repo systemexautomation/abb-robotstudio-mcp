@@ -260,11 +260,11 @@ Le serveur expose **72 outils** : 42 outils `rs_*` (SDK RobotStudio via l'add-in
 
 | | Outils |
 |---|---|
-| **SDK (15)** | `rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`, `rs_save_station`, `rs_write_module`, `rs_write_variable`, `rs_write_io_signal`, `rs_write_config`, `rs_create_path`, `rs_create_target`, `rs_start_simulation`, `rs_stop_simulation`, `rs_pause_simulation`, `rs_reset_simulation`, `rs_set_sim_speed` |
+| **SDK (15)** | `rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`, `rs_create_solid_part`, `rs_modify_solid_part`, `rs_transform_part`, `rs_save_station`, `rs_write_module`, `rs_write_variable`, `rs_write_io_signal`, `rs_write_config`, `rs_create_path`, `rs_create_target`, `rs_start_simulation`, `rs_stop_simulation`, `rs_pause_simulation`, `rs_reset_simulation`, `rs_set_sim_speed` |
 | **RWS (17)** | `rws_set_controller_url`, `rws_set_motors`, `rws_start_program`, `rws_stop_program`, `rws_reset_pp`, `rws_write_module`, `rws_load_module_from_file`, `rws_unload_module`, `rws_save_program`, `rws_load_program`, `rws_restart_controller`, `rws_write_variable`, `rws_write_io`, `rws_set_speed_override`, `rws_write_file`, `rws_request_mastership`, `rws_release_mastership` |
 
 Garde-fous à connaître :
-- Les outils qui modifient la géométrie de la station (`rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`) forment **une seule étape d'annulation** (Ctrl+Z dans RobotStudio) et **n'enregistrent pas** la station. C'est à vous de faire Ctrl+S.
+- Les outils qui modifient la géométrie de la station (`rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`, `rs_create_solid_part`, `rs_modify_solid_part`) forment **une seule étape d'annulation** (Ctrl+Z dans RobotStudio) et **n'enregistrent pas** la station. C'est à vous de faire Ctrl+S.
 - `rs_start_simulation` et `rws_start_program` refusent de démarrer s'ils détectent des erreurs RAPID dans le journal du contrôleur, sauf avec `force=true`. Cela ne remplace pas la prudence.
 - Les écritures RAPID sont validées (équilibre des blocs) avant envoi ; `rs_validate_rapid` permet de le faire seul.
 - Les chemins de fichiers du contrôleur sont contrôlés : `..` est refusé et la partition `$SYSTEM` est protégée.

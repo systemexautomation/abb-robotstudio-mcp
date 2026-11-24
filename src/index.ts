@@ -231,6 +231,53 @@ server.tool("rs_set_part_frame", "MODIFIES THE STATION. Move a Part's local fram
   } catch (e: any) { return err(e); } }
 );
 
+const solidShape = z.enum(["box", "cylinder", "cone", "sphere", "pyramid"]);
+const solidDims = {
+  shape: solidShape.describe("Solid type: box, cylinder, cone, sphere or pyramid"),
+  size: z.array(z.number().positive()).length(3).optional().describe("box: [length (X), width (Y), height (Z)] in mm"),
+  radius: z.number().positive().optional().describe("cylinder, cone (base radius) or sphere: radius in mm"),
+  height: z.number().positive().optional().describe("cylinder, cone or pyramid: height in mm"),
+  topRadius: z.number().min(0).optional().describe("cone: top radius in mm (frustum); omit for a pointed cone"),
+  baseSize: z.number().positive().optional().describe("pyramid: distance from the base centre to a base corner in mm (a 4-sided pyramid of baseSize 80 has a square base of side 113.1)"),
+  sides: z.number().int().min(3).optional().describe("pyramid: number of base sides (default 4)"),
+};
+
+server.tool("rs_create_solid_part", "MODIFIES THE STATION. Create a new Part holding one simple solid (box, cylinder, cone, sphere or pyramid), dimensions in mm. The Part frame is the given pose (default: station origin, axes aligned). The solid is built in that frame: box = corner at the origin, extending along +X/+Y/+Z; cylinder/cone/pyramid = base centre at the origin, height along +Z; sphere = centre at the origin. The result reports the real bounding box and whether the extents match. One undo step (Ctrl+Z). Does not save the station.",
+  {
+    name: z.string().min(1).describe("Name of the new Part (must not already exist)"),
+    ...solidDims,
+    origin: z.array(z.number()).length(3).optional().describe("Frame origin [x,y,z] in mm, station coordinates (default [0,0,0])"),
+    xAxis: z.array(z.number()).length(3).optional().describe("Frame X axis direction (default [1,0,0])"),
+    zAxis: z.array(z.number()).length(3).optional().describe("Frame Z axis direction, perpendicular to xAxis (default [0,0,1])"),
+  },
+  async (args) => { try {
+    return ok(await bridge("/station/part/create-solid", "POST", args, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_modify_solid_part", "MODIFIES THE STATION. Replace the geometry of an existing Part by a new simple solid (box, cylinder, cone, sphere or pyramid, dimensions in mm), keeping its name, frame and references (SmartComponent properties, parents). The solid is built in the Part's current frame with the same conventions as rs_create_solid_part. Refuses a Part with several bodies (imported CAD) unless force=true. One undo step (Ctrl+Z). Does not save the station.",
+  {
+    name: z.string().min(1).describe("Exact name of the existing Part"),
+    ...solidDims,
+    force: z.boolean().optional().describe("Replace even when the Part has several bodies (default false)"),
+  },
+  async (args) => { try {
+    return ok(await bridge("/station/part/modify-solid", "POST", args, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_transform_part", "MODIFIES THE STATION. Move a whole Part rigidly (frame AND geometry together, unlike rs_set_part_frame): first rotate it by rotateZ degrees about the vertical axis through pivot (default: the Part frame origin), then translate it. Use it to turn a Part by 90 degrees. Read the exact result with rs_get_object_parts mode=bodies source=faces. One undo step (Ctrl+Z). Does not save the station.",
+  {
+    name: z.string().min(1).describe("Exact name of the Part"),
+    rotateZ: z.number().optional().describe("Rotation in degrees about the vertical axis (counter-clockwise seen from above)"),
+    pivot: z.array(z.number()).length(2).optional().describe("Rotation centre [x,y] in mm, station coordinates (default: the Part frame origin)"),
+    translate: z.array(z.number()).length(3).optional().describe("Translation [dx,dy,dz] in mm applied after the rotation"),
+  },
+  async (args) => { try {
+    return ok(await bridge("/station/part/transform", "POST", args, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
 server.tool("rs_get_smartcomponent_library", "List the built-in SmartComponents (Source, Sink, LinearMover2, Attacher, LogicGate, Timer...) that rs_edit_station_logic can create with op=create + library.", {},
   async () => { try { return ok(await bridge("/station/logic/library")); } catch (e: any) { return err(e); } }
 );
@@ -486,6 +533,20 @@ server.tool("rs_write_config", "Write controller config file",
 
 server.tool("rs_check_collisions", "Run collision check on station objects", {},
   async () => { try { return ok(await bridge("/collision/check")); } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_create_collision_set", "MODIFIES THE STATION. Create an active RobotStudio collision set between two groups of existing graphic objects (names of Parts, Groups or Mechanisms, e.g. the robot against the cell). Colliding objects are highlighted in the graphics window. Objects created during the simulation cannot be put in a set. One undo step (Ctrl+Z). Does not save the station.",
+  {
+    name: z.string().min(1).describe("Name of the collision set"),
+    first: z.array(z.string().min(1)).min(1).describe("Names of the objects of the first group"),
+    second: z.array(z.string().min(1)).min(1).describe("Names of the objects of the second group"),
+    color: z.array(z.number().int().min(0).max(255)).length(3).optional().describe("Highlight color [r,g,b] (default red)"),
+    nearMiss: z.number().min(0).optional().describe("Near-miss distance in mm (default 0 = collisions only)"),
+    replace: z.boolean().optional().describe("Replace an existing set of the same name (default false)"),
+  },
+  async (args) => { try {
+    return ok(await bridge("/collision/set", "POST", args, 30000));
+  } catch (e: any) { return err(e); } }
 );
 
 server.tool("rs_get_position", "Get robot position via SDK", {},
