@@ -16,7 +16,7 @@ import { BRIDGE_URL, getRwsUrl, setRwsUrl, LARGE_MODULE_THRESHOLD } from "./conf
 import { bridge } from "./bridge-client.js";
 import {
   rws, rwsExtract, rwsExtractAll, rwsPostForm,
-  resetRwsSession, mastershipRequest, mastershipRelease,
+  resetRwsSession, mastershipRequest, mastershipRelease, withWriteAccess, RwsError,
 } from "./rws-client.js";
 import { validateRapidCode } from "./rapid-validator.js";
 import { checkSimulationSafety, checkExecutionSafety } from "./safety-guard.js";
@@ -907,6 +907,39 @@ server.tool("rws_write_io", "Set an I/O signal value via RWS",
     const r = await rws("POST", `/rw/iosystem/signals/${signal}/set-value`,
       `lvalue=${value}`, "application/x-www-form-urlencoded;v=2.0");
     return ok({ result: r.status === 204 ? `${signal} = ${value}` : r.body });
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rws_create_signals", "MODIFIES THE CONTROLLER CONFIGURATION. Create I/O signals (EIO_SIGNAL instances) through RWS, registering as a remote control station for write access (RobotWare 8). Only missing signals are created; existing ones are left unchanged. The controller must be restarted before the new signals can be used.",
+  {
+    signals: z.array(z.object({
+      name: z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,31}$/).describe("Signal name"),
+      type: z.enum(["DI", "DO", "AI", "AO", "GI", "GO"]).optional().describe("Signal type (default DO)"),
+      access: z.string().optional().describe("Access level (default All)"),
+      device: z.string().optional().describe("I/O device (default none: simulated signal)"),
+    })).min(1),
+  },
+  async ({ signals }) => { try {
+    const path = (n: string) => `/rw/cfg/EIO/EIO_SIGNAL/instances/${encodeURIComponent(n)}`;
+    const exists = async (n: string) => {
+      try { await rws(path(n)); return true; }
+      catch (e) { if (e instanceof RwsError && e.status === 404) return false; throw e; }
+    };
+    const created: string[] = [], existing: string[] = [];
+    await withWriteAccess(async () => {
+      for (const s of signals) {
+        if (await exists(s.name)) { existing.push(s.name); continue; }
+        await rwsPostForm("/rw/cfg/EIO/EIO_SIGNAL/instances/create-default", { name: s.name });
+        const attrs: Record<string, string> = {
+          SignalType: `[${s.type ?? "DO"},1]`,
+          Access: `[${s.access ?? "All"},1]`,
+        };
+        if (s.device) attrs.Device = `[${s.device},1]`;
+        await rwsPostForm(path(s.name), attrs);
+        created.push(s.name);
+      }
+    });
+    return ok({ created, existing, note: created.length ? "Restart the controller to use the new signals." : "Nothing created." });
   } catch (e: any) { return err(e); } }
 );
 

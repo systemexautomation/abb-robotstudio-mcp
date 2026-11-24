@@ -34,7 +34,7 @@ Quatre composants, trois liens :
 | Composant | Rôle | Où il s'exécute |
 |---|---|---|
 | **Claude** (Desktop ou Code) | Lance le serveur MCP et appelle ses outils | Sur le poste |
-| **Serveur MCP** (TypeScript, dossier `src/`) | Expose 76 outils à Claude | En dehors de RobotStudio, lancé par Claude |
+| **Serveur MCP** (TypeScript, dossier `src/`) | Expose 77 outils à Claude | En dehors de RobotStudio, lancé par Claude |
 | **Add-in ClaudeBridge** (C#, dossier `addin/`) | Donne accès au SDK RobotStudio (station, pièces, simulation) | Dans RobotStudio, écoute sur `127.0.0.1:58080` uniquement |
 | **Contrôleur virtuel** | Fait tourner le RAPID de la station et expose les Robot Web Services | Lancé par RobotStudio |
 
@@ -247,7 +247,7 @@ Si les outils `rs_*` n'apparaissent pas dans Claude, passez au dépannage.
 
 ## 7. Les outils
 
-Le serveur expose **76 outils** : 46 outils `rs_*` (SDK RobotStudio via l'add-in) et 30 outils `rws_*` (Robot Web Services).
+Le serveur expose **77 outils** : 46 outils `rs_*` (SDK RobotStudio via l'add-in) et 31 outils `rws_*` (Robot Web Services).
 
 ### 7.1 Ce qui ne modifie rien
 
@@ -261,7 +261,7 @@ Le serveur expose **76 outils** : 46 outils `rs_*` (SDK RobotStudio via l'add-in
 | | Outils |
 |---|---|
 | **SDK (21)** | `rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`, `rs_create_solid_part`, `rs_modify_solid_part`, `rs_transform_part`, `rs_save_station`, `rs_write_module`, `rs_write_variable`, `rs_write_io_signal`, `rs_write_config`, `rs_create_path`, `rs_create_target`, `rs_start_simulation`, `rs_stop_simulation`, `rs_pause_simulation`, `rs_reset_simulation`, `rs_set_sim_speed`, `rs_edit_station_logic`, `rs_create_config_signals`, `rs_create_collision_set` |
-| **RWS (17)** | `rws_set_controller_url`, `rws_set_motors`, `rws_start_program`, `rws_stop_program`, `rws_reset_pp`, `rws_write_module`, `rws_load_module_from_file`, `rws_unload_module`, `rws_save_program`, `rws_load_program`, `rws_restart_controller`, `rws_write_variable`, `rws_write_io`, `rws_set_speed_override`, `rws_write_file`, `rws_request_mastership`, `rws_release_mastership` |
+| **RWS (18)** | `rws_set_controller_url`, `rws_set_motors`, `rws_start_program`, `rws_stop_program`, `rws_reset_pp`, `rws_write_module`, `rws_load_module_from_file`, `rws_unload_module`, `rws_save_program`, `rws_load_program`, `rws_restart_controller`, `rws_write_variable`, `rws_write_io`, `rws_set_speed_override`, `rws_write_file`, `rws_request_mastership`, `rws_release_mastership`, `rws_create_signals` |
 
 Garde-fous à connaître :
 - Les outils qui modifient la géométrie de la station (`rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`, `rs_create_solid_part`, `rs_modify_solid_part`, `rs_transform_part`), ainsi que `rs_edit_station_logic` et `rs_create_collision_set`, forment **une seule étape d'annulation** (Ctrl+Z dans RobotStudio) et **n'enregistrent pas** la station. C'est à vous de faire Ctrl+S.

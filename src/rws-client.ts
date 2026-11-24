@@ -3,7 +3,7 @@
  * v3.1.0 — Robot Web Services client with Digest auth support
  */
 
-import { createHash, randomUUID } from "crypto";
+import { createHash, randomUUID, randomInt } from "crypto";
 import { request as httpsRequest } from "node:https";
 import { getRwsUrl, RWS_USER, RWS_PASS } from "./config.js";
 
@@ -187,17 +187,21 @@ export async function rws(
     headers["Authorization"] = rwsDigestAuth(method, path);
   }
   if (_cookie) headers["Cookie"] = _cookie;
-  if (body && contentType) {
+  if (body !== undefined && contentType) {
     headers["Content-Type"] = _useV2 && !/v=2.0/.test(contentType) ? contentType + ";v=2.0" : contentType;
   }
 
   const res = await rwsFetch(url, { method, headers, body: body ?? null });
 
-  // Track session cookie
+  // Track the session cookies (RobotWare 8 sets several; the control station
+  // registration is bound to the session, so none of them may be dropped)
   const setCookie = res.headers.getSetCookie();
   for (const c of setCookie) {
-    if (c.includes("ABBCX") || c.includes("-http-session"))
-      _cookie = c.split(";")[0] ?? "";
+    if (!(c.includes("ABBCX") || c.includes("-http-session"))) continue;
+    const pair = c.split(";")[0] ?? "";
+    const key = pair.split("=")[0];
+    const kept = _cookie ? _cookie.split("; ").filter((p) => p.split("=")[0] !== key) : [];
+    _cookie = [...kept, pair].join("; ");
   }
 
   // RobotWare 8: "Content type is not supported. Use ... ;v=2.0" — remember and retry once
@@ -255,6 +259,27 @@ export async function rwsPostForm(
     .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
     .join("&");
   return rws("POST", path, formBody, "application/x-www-form-urlencoded");
+}
+
+// ── Control station (RobotWare 8) ───────────────────────────
+
+// RobotWare 8 replaced mastership by the control station service: a client must register as a
+// remote control station, then request write access, before it may change the configuration.
+export async function withWriteAccess<T>(fn: () => Promise<T>): Promise<T> {
+  await rwsPostForm("/rw/controlstation/register/remote", {
+    "control-station-name": "ClaudeBridge",
+    "control-station-id": `{${randomUUID()}}`,
+    pincode: String(randomInt(1_000_000_000)),
+    "release-write-access-when-lost": "true",
+  });
+  // RobotWare 8 wants the form content type even on a POST without parameters
+  const form = "application/x-www-form-urlencoded;v=2.0";
+  await rws("POST", "/rw/controlstation/writeaccess/request", "", form);
+  try {
+    return await fn();
+  } finally {
+    await rws("POST", "/rw/controlstation/writeaccess/release", "", form).catch(() => {});
+  }
 }
 
 // ── Mastership ──────────────────────────────────────────────
