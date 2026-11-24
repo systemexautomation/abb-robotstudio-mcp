@@ -1,12 +1,12 @@
 # ABB RobotStudio MCP Server — LiskinLabs Edition
 
-> **v3.1.0 (Safety-First & Hardened Edition)** — Advanced MCP server for ABB RobotStudio and ABB robot controllers with TcpListener transport, 72 MCP tools, AutoLoad, RAPID syntax validator, pre-simulation safety guards, and path-traversal protection.
+> **v3.1.0 (Safety-First & Hardened Edition)** — Advanced MCP server for ABB RobotStudio and ABB robot controllers with TcpListener transport, 76 MCP tools, AutoLoad, RAPID syntax validator, pre-simulation safety guards, and path-traversal protection.
 
 Model Context Protocol (MCP) server for ABB RobotStudio (desktop application) and ABB robot controllers (OmniCore / IRC5 / Virtual Controllers).
 
-Exposes **72 tools** across two transports:
+Exposes **76 tools** across two transports:
 
-- **`rs_*`** (42 tools) — RobotStudio SDK via TcpListener in-process Add-In. Inspect/edit stations, targets, paths, modules, variables, I/O signals, configs. Drive simulation with safety guards. Capture screenshots.
+- **`rs_*`** (46 tools) — RobotStudio SDK via TcpListener in-process Add-In. Inspect/edit stations, targets, paths, modules, variables, I/O signals, configs. Drive simulation with safety guards. Capture screenshots.
 - **`rws_*`** (30 tools) — Robot Web Services REST API direct to controller. Motors, program execution, I/O signals, filesystem, mastership, event log, runtime target controller switching.
 
 Tested with: **ABB RobotStudio 2026 (26.2) + Virtual Controller (RobotWare 7)** on Windows 11 x64.
@@ -97,13 +97,13 @@ curl http://localhost:58080/ping
 
 ## 🛠️ Complete Tool Index (72 Tools)
 
-### SDK Tools (`rs_*`) — 42 tools
+### SDK Tools (`rs_*`) — 46 tools
 - **Connection & Status:** `rs_ping`, `rs_controller_status`, `rs_check_safety`
 - **Station Management:** `rs_get_station`, `rs_get_station_logic`, `rs_get_station_objects`, `rs_get_object_parts`, `rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`, `rs_create_solid_part`, `rs_modify_solid_part`, `rs_transform_part`, `rs_edit_station_logic`, `rs_get_smartcomponent_library`, `rs_list_config_signals`, `rs_create_config_signals`, `rs_save_station`, `rs_get_screenshot`
 - **RAPID Management:** `rs_get_tasks`, `rs_get_modules`, `rs_read_module`, `rs_write_module`, `rs_validate_rapid`
 - **Variables & Data:** `rs_read_variable`, `rs_write_variable`, `rs_list_variables`
 - **I/O Signals:** `rs_get_io_signals`, `rs_read_io_signal`, `rs_write_io_signal`
-- **Simulation Control:** `rs_start_simulation`, `rs_stop_simulation`, `rs_pause_simulation`, `rs_reset_simulation`, `rs_simulation_status`, `rs_set_sim_speed`, `rs_check_collisions`
+- **Simulation Control:** `rs_start_simulation`, `rs_stop_simulation`, `rs_pause_simulation`, `rs_reset_simulation`, `rs_simulation_status`, `rs_set_sim_speed`, `rs_check_collisions`, `rs_create_collision_set`
 - **Motion & Targets:** `rs_get_position`, `rs_get_paths`, `rs_get_path_targets`, `rs_create_path`, `rs_create_target`
 - **Diagnostics & Config:** `rs_get_execution_errors`, `rs_read_config`, `rs_write_config`
 

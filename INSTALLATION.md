@@ -34,7 +34,7 @@ Quatre composants, trois liens :
 | Composant | Rôle | Où il s'exécute |
 |---|---|---|
 | **Claude** (Desktop ou Code) | Lance le serveur MCP et appelle ses outils | Sur le poste |
-| **Serveur MCP** (TypeScript, dossier `src/`) | Expose 72 outils à Claude | En dehors de RobotStudio, lancé par Claude |
+| **Serveur MCP** (TypeScript, dossier `src/`) | Expose 76 outils à Claude | En dehors de RobotStudio, lancé par Claude |
 | **Add-in ClaudeBridge** (C#, dossier `addin/`) | Donne accès au SDK RobotStudio (station, pièces, simulation) | Dans RobotStudio, écoute sur `127.0.0.1:58080` uniquement |
 | **Contrôleur virtuel** | Fait tourner le RAPID de la station et expose les Robot Web Services | Lancé par RobotStudio |
 
@@ -247,24 +247,24 @@ Si les outils `rs_*` n'apparaissent pas dans Claude, passez au dépannage.
 
 ## 7. Les outils
 
-Le serveur expose **72 outils** : 42 outils `rs_*` (SDK RobotStudio via l'add-in) et 30 outils `rws_*` (Robot Web Services).
+Le serveur expose **76 outils** : 46 outils `rs_*` (SDK RobotStudio via l'add-in) et 30 outils `rws_*` (Robot Web Services).
 
 ### 7.1 Ce qui ne modifie rien
 
 | | Outils |
 |---|---|
-| **SDK (23)** | `rs_ping`, `rs_get_station`, `rs_get_station_logic`, `rs_get_station_objects`, `rs_get_object_parts`, `rs_get_tasks`, `rs_get_modules`, `rs_read_module`, `rs_read_variable`, `rs_list_variables`, `rs_get_execution_errors`, `rs_get_screenshot`, `rs_controller_status`, `rs_simulation_status`, `rs_get_paths`, `rs_get_path_targets`, `rs_read_config`, `rs_check_collisions`, `rs_get_position`, `rs_get_io_signals`, `rs_read_io_signal`, `rs_validate_rapid`, `rs_check_safety` |
+| **SDK (25)** | `rs_ping`, `rs_get_station`, `rs_get_station_logic`, `rs_get_station_objects`, `rs_get_object_parts`, `rs_get_tasks`, `rs_get_modules`, `rs_read_module`, `rs_read_variable`, `rs_list_variables`, `rs_get_execution_errors`, `rs_get_screenshot`, `rs_controller_status`, `rs_simulation_status`, `rs_get_paths`, `rs_get_path_targets`, `rs_read_config`, `rs_check_collisions`, `rs_get_position`, `rs_get_io_signals`, `rs_read_io_signal`, `rs_validate_rapid`, `rs_check_safety`, `rs_get_smartcomponent_library`, `rs_list_config_signals` |
 | **RWS (13)** | `rws_controller_status`, `rws_execution_state`, `rws_get_tasks`, `rws_get_modules`, `rws_read_module`, `rws_read_variable`, `rws_get_position`, `rws_get_io_signals`, `rws_read_io`, `rws_get_speed_override`, `rws_event_log`, `rws_list_files`, `rws_read_file` |
 
 ### 7.2 Ce qui modifie la station, le contrôleur ou la simulation
 
 | | Outils |
 |---|---|
-| **SDK (15)** | `rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`, `rs_create_solid_part`, `rs_modify_solid_part`, `rs_transform_part`, `rs_save_station`, `rs_write_module`, `rs_write_variable`, `rs_write_io_signal`, `rs_write_config`, `rs_create_path`, `rs_create_target`, `rs_start_simulation`, `rs_stop_simulation`, `rs_pause_simulation`, `rs_reset_simulation`, `rs_set_sim_speed` |
+| **SDK (21)** | `rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`, `rs_create_solid_part`, `rs_modify_solid_part`, `rs_transform_part`, `rs_save_station`, `rs_write_module`, `rs_write_variable`, `rs_write_io_signal`, `rs_write_config`, `rs_create_path`, `rs_create_target`, `rs_start_simulation`, `rs_stop_simulation`, `rs_pause_simulation`, `rs_reset_simulation`, `rs_set_sim_speed`, `rs_edit_station_logic`, `rs_create_config_signals`, `rs_create_collision_set` |
 | **RWS (17)** | `rws_set_controller_url`, `rws_set_motors`, `rws_start_program`, `rws_stop_program`, `rws_reset_pp`, `rws_write_module`, `rws_load_module_from_file`, `rws_unload_module`, `rws_save_program`, `rws_load_program`, `rws_restart_controller`, `rws_write_variable`, `rws_write_io`, `rws_set_speed_override`, `rws_write_file`, `rws_request_mastership`, `rws_release_mastership` |
 
 Garde-fous à connaître :
-- Les outils qui modifient la géométrie de la station (`rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`, `rs_create_solid_part`, `rs_modify_solid_part`) forment **une seule étape d'annulation** (Ctrl+Z dans RobotStudio) et **n'enregistrent pas** la station. C'est à vous de faire Ctrl+S.
+- Les outils qui modifient la géométrie de la station (`rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`, `rs_create_solid_part`, `rs_modify_solid_part`, `rs_transform_part`), ainsi que `rs_edit_station_logic` et `rs_create_collision_set`, forment **une seule étape d'annulation** (Ctrl+Z dans RobotStudio) et **n'enregistrent pas** la station. C'est à vous de faire Ctrl+S.
 - `rs_start_simulation` et `rws_start_program` refusent de démarrer s'ils détectent des erreurs RAPID dans le journal du contrôleur, sauf avec `force=true`. Cela ne remplace pas la prudence.
 - Les écritures RAPID sont validées (équilibre des blocs) avant envoi ; `rs_validate_rapid` permet de le faire seul.
 - Les chemins de fichiers du contrôleur sont contrôlés : `..` est refusé et la partition `$SYSTEM` est protégée.
