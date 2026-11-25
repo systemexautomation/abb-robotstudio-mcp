@@ -4,7 +4,7 @@ Points qui concernent le code du dépôt. Les points propres à la cellule sont 
 
 - [ ] `rs_create_config_signals` ne fonctionne pas sur RobotWare 8 : le retirer ou le documenter comme non fonctionnel.
 - [ ] `rs_write_io_signal` (SDK) échoue sur RobotWare 8 : utiliser `rws_write_io`.
-- [ ] Outils RWS qui passent par le mastership (`/rw/mastership` renvoie 410 sur RobotWare 8) : à revoir.
+- [ ] Outils RWS qui passent par le mastership (`/rw/mastership` renvoie 410 sur RobotWare 8) : les outils d'écriture RAPID (`rws_write_module`, `rws_load_module_from_file`, `rws_unload_module`, `rws_write_variable`) passent maintenant par `withRapidWriteAccess` (mastership, ou Control Station sur RobotWare 8) et par les routes RWS 2 (`/loadmod`, `/unloadmod`, `POST .../data`) avec repli sur la syntaxe RWS 1 (2026-11-25). Restent à revoir : `rws_load_program`, `rws_save_program`, l'exécution (`rws_start_program`, `rws_stop_program`, `rws_reset_pp`), `rws_set_motors`, `rws_set_speed_override`, `rws_request_mastership` / `rws_release_mastership`.
 - [ ] URL RWS par défaut `https://127.0.0.1:80` dans `config.ts` (proposé, non validé).
 - [ ] Commentaires « RobotWare 7 » à corriger en « RobotWare 8 » (`src/rws-client.ts` et autres).
 - [ ] Ajouter un outil de lecture de la pose d'un outil (`RsToolData`) si besoin.

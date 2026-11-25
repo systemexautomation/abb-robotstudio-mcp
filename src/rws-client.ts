@@ -204,14 +204,15 @@ export async function rws(
     _cookie = [...kept, pair].join("; ");
   }
 
-  // RobotWare 8: "Content type is not supported. Use ... ;v=2.0" — remember and retry once
-  if (res.status === 406 && body && contentType && !_useV2) {
+  // RobotWare 8: "Content type is not supported. Use ... ;v=2.0" (406, or 415 for a file PUT)
+  // — remember and retry once
+  if ((res.status === 406 || res.status === 415) && body && contentType && !_useV2) {
     const text = await res.text().catch(() => "");
     if (/v=2.0/.test(text)) {
       _useV2 = true;
       return rws(method, path, body, contentType);
     }
-    throw new RwsError(`RWS ${method} ${path} → 406`, 406, text);
+    throw new RwsError(`RWS ${method} ${path} → ${res.status}`, res.status, text);
   }
 
   // Handle 401 — negotiate or refresh Digest auth
@@ -264,21 +265,98 @@ export async function rwsPostForm(
 // ── Control station (RobotWare 8) ───────────────────────────
 
 // RobotWare 8 replaced mastership by the control station service: a client must register as a
-// remote control station, then request write access, before it may change the configuration.
+// remote control station, then request write access, before it may change the configuration
+// or the RAPID program. Only one control station holds write access (SPoC, single point of
+// control): when another one holds it (for example the FlexPendant), the request is refused.
 export async function withWriteAccess<T>(fn: () => Promise<T>): Promise<T> {
-  await rwsPostForm("/rw/controlstation/register/remote", {
-    "control-station-name": "ClaudeBridge",
-    "control-station-id": `{${randomUUID()}}`,
-    pincode: String(randomInt(1_000_000_000)),
-    "release-write-access-when-lost": "true",
-  });
+  try {
+    await rwsPostForm("/rw/controlstation/register/remote", {
+      "control-station-name": "ClaudeBridge",
+      "control-station-id": `{${randomUUID()}}`,
+      pincode: String(randomInt(1_000_000_000)),
+      "release-write-access-when-lost": "true",
+    });
+  } catch (e) {
+    // The registration is bound to the RWS session: a second write in the same session
+    // finds this client already registered, which is fine
+    if (!(e instanceof RwsError && e.status === 403 && /already been registered/i.test(e.body))) throw e;
+  }
   // RobotWare 8 wants the form content type even on a POST without parameters
   const form = "application/x-www-form-urlencoded;v=2.0";
-  await rws("POST", "/rw/controlstation/writeaccess/request", "", form);
+  try {
+    await rws("POST", "/rw/controlstation/writeaccess/request", "", form);
+  } catch (e) {
+    if (e instanceof RwsError && e.status === 400) {
+      const holder = await writeAccessHolder().catch(() => "");
+      throw new Error(
+        "Write access refused by the controller" +
+        (holder ? `: it is held by the control station "${holder}".` : ".") +
+        " Release write access on that control station (or close it), then retry." +
+        ` (${e.message}: ${e.body.slice(0, 200)})`
+      );
+    }
+    throw e;
+  }
   try {
     return await fn();
   } finally {
     await rws("POST", "/rw/controlstation/writeaccess/release", "", form).catch(() => {});
+  }
+}
+
+// Name of the control station that holds write access ("" when none)
+async function writeAccessHolder(): Promise<string> {
+  const r = await rws("/rw/controlstation/writeaccess/status");
+  const held = /control-station-write-access-held[^>]*>\s*true|"control-station-write-access-held"\s*:\s*"true"/i.test(r.body);
+  if (!held) return "";
+  return (
+    rwsExtract(r.body, "held-by-control-station-name") ||
+    (r.body.match(/"held-by-control-station-name"\s*:\s*"([^"]*)"/)?.[1] ?? "")
+  );
+}
+
+// Runs a RAPID write with the right kind of access for the controller:
+// mastership on RobotWare 6 / 7, control station write access on RobotWare 8
+// (where the mastership service answers 410 Gone).
+export async function withRapidWriteAccess<T>(fn: () => Promise<T>): Promise<T> {
+  let mastership = false;
+  const path = "/rw/mastership/rapid?action=request";
+  const form = "application/x-www-form-urlencoded";
+  try {
+    try {
+      await rws("POST", path, "", form);
+    } catch (e) {
+      // RobotWare 8 answers 406 to a content type without the API version, before 410
+      if (!(e instanceof RwsError && e.status === 406)) throw e;
+      await rws("POST", path, "", form + ";v=2.0");
+    }
+    mastership = true;
+  } catch (e) {
+    if (!(e instanceof RwsError && (e.status === 410 || e.status === 404 || e.status === 405))) throw e;
+  }
+  if (!mastership) return withWriteAccess(fn);
+  try {
+    return await fn();
+  } finally {
+    await mastershipRelease("rapid");
+  }
+}
+
+// RobotWare 8 (RWS 2) moved the actions into the path (".../loadmod"); RobotWare 6 / 7 (RWS 1)
+// take them as a query (...?action=loadmod). Try the RWS 2 form first, then the RWS 1 form when
+// the resource does not exist or does not accept the method.
+export async function rwsPostAction(
+  rws2Path: string,
+  rws1Path: string,
+  params: Record<string, string>
+): Promise<{ status: number; body: string }> {
+  try {
+    return await rwsPostForm(rws2Path, params);
+  } catch (e) {
+    if (e instanceof RwsError && (e.status === 404 || e.status === 405)) {
+      return rwsPostForm(rws1Path, params);
+    }
+    throw e;
   }
 }
 

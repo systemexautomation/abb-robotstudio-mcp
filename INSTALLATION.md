@@ -287,7 +287,7 @@ Garde-fous à connaître :
 - **Grandes stations** : une réponse de plus de 1 Mo est refusée par le client MCP. Filtrez avec `nameFilter` et `limit`, et lisez `matchedCount` / `truncated` dans la réponse.
 - **Pièces importées de la CAO** (des milliers de corps sans nom) : `rs_get_object_parts` avec `mode="bodies"` ou `"clusters"` lit le maillage d'affichage et répond en quelques secondes. N'utilisez pas `source="faces"` sans raison : ce calcul exact peut figer RobotStudio pendant plusieurs minutes.
 - **Modules RAPID** : `rs_read_module` lit au besoin la copie du module sur le disque du contrôleur virtuel, y compris les fichiers `.modx`. Cette copie peut être plus ancienne que ce qui est chargé dans le contrôleur ; la réponse indique le fichier lu et sa date.
-- **Écritures RWS** : certaines écritures exigent la *mastership* du contrôleur. Demandez-la avec `rws_request_mastership` avant d'écrire, puis rendez-la avec `rws_release_mastership`. `rws_write_module` la gère automatiquement.
+- **Écritures RWS** : les outils qui modifient le RAPID (`rws_write_module`, `rws_load_module_from_file`, `rws_unload_module`, `rws_write_variable`) prennent eux-mêmes les droits d'écriture : la *mastership* sur RobotWare 6 et 7, l'accès en écriture d'une *Control Station* distante sur RobotWare 8 (où `/rw/mastership` répond 410). Sur RobotWare 8, un seul poste détient l'accès en écriture : si le FlexPendant le détient, l'écriture est refusée et l'outil nomme le poste qui le détient. Libérez l'accès sur ce poste (ou fermez-le), puis recommencez. `rws_write_module` envoie le texte dans un fichier temporaire de `$HOME` puis le charge dans la tâche : le fichier que `SYS.cfg` recharge au reset n'est pas modifié.
 
 ---
 

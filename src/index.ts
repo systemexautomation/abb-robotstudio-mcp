@@ -16,7 +16,7 @@ import { BRIDGE_URL, getRwsUrl, setRwsUrl, LARGE_MODULE_THRESHOLD } from "./conf
 import { bridge } from "./bridge-client.js";
 import {
   rws, rwsExtract, rwsExtractAll, rwsPostForm,
-  resetRwsSession, mastershipRequest, mastershipRelease, withWriteAccess, RwsError,
+  resetRwsSession, withWriteAccess, withRapidWriteAccess, rwsPostAction, RwsError,
 } from "./rws-client.js";
 import { validateRapidCode } from "./rapid-validator.js";
 import { checkSimulationSafety, checkExecutionSafety } from "./safety-guard.js";
@@ -69,31 +69,38 @@ async function uploadLargeModule(task: string, module: string, code: string): Pr
   if (module.includes("..") || !/^[a-zA-Z0-9_\-]+$/.test(module)) {
     throw new Error(`Invalid module name "${module}" — must contain only [a-zA-Z0-9_-] and no ".."`);
   }
-  const remoteDir = "$HOME/_claude_upload";
-  const remoteFile = `${remoteDir}/${module}.mod`;
+  // Temporary file directly in $HOME (the file service does not create missing directories)
+  const remoteFile = `$HOME/_claude_upload_${module}.modx`;
+  const fileUrl = `/fileservice/${encodeURIComponent(remoteFile)}`;
 
+  // Upload the module text to the controller filesystem
+  await rws("PUT", fileUrl, code, "text/plain");
   try {
-    // Upload .mod file to controller filesystem
-    await rws("PUT", `/fileservice/${encodeURIComponent(remoteFile)}`, code, "text/plain");
-
-    // Request mastership and load module from file
-    await mastershipRequest("rapid");
-    try {
-      const r = await rwsPostForm(`/rw/rapid/tasks/${task}?action=loadmod`, {
-        modulepath: remoteFile,
-        replace: "true",
-      });
-      return { success: true, message: `Module ${module} loaded via RWS file upload (${r.status})` };
-    } finally {
-      await mastershipRelease("rapid").catch(() => {});
-      // Clean up temp file
-      await rws("POST", `/fileservice/${encodeURIComponent(remoteDir)}?action=remove`).catch(() => {});
-    }
-  } catch (e: any) {
-    // Clean up on error
-    try { await rws("POST", `/fileservice/${encodeURIComponent(remoteDir)}?action=remove`); } catch {}
-    throw e;
+    // Load it in the task, replacing the module of the same name
+    // (mastership on RobotWare 6 / 7, control station write access on RobotWare 8)
+    const r = await withRapidWriteAccess(() => loadModule(task, remoteFile, true));
+    return { success: true, message: `Module ${module} loaded via RWS file upload (${r.status})` };
+  } finally {
+    // Clean up the temp file
+    await rws("DELETE", fileUrl).catch(() => {});
   }
+}
+
+// RAPID task actions, RWS 2 route first (RobotWare 8), then RWS 1 (RobotWare 6 / 7).
+// The caller holds the write access.
+function loadModule(task: string, modulepath: string, replace: boolean) {
+  return rwsPostAction(`/rw/rapid/tasks/${task}/loadmod`, `/rw/rapid/tasks/${task}?action=loadmod`,
+    { modulepath, replace: replace ? "true" : "false" });
+}
+
+function unloadModule(task: string, module: string) {
+  return rwsPostAction(`/rw/rapid/tasks/${task}/unloadmod`, `/rw/rapid/tasks/${task}?action=unloadmod`,
+    { module });
+}
+
+function setSymbolValue(task: string, module: string, variable: string, value: string) {
+  const sym = `/rw/rapid/symbol/RAPID/${task}/${module}/${variable}/data`;
+  return rwsPostAction(sym, `${sym}?action=set`, { value });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -477,14 +484,24 @@ server.tool("rs_reset_simulation", "Reset simulation to start position (stops si
   async () => { try { return ok(await bridge("/simulation/reset", "POST")); } catch (e: any) { return err(e); } }
 );
 
-server.tool("rs_simulation_status", "Get simulation state and time", {},
+server.tool("rs_simulation_status",
+  "Get simulation state, time, speed multiplier and fullSpeed (As fast as possible)", {},
   async () => { try { return ok(await bridge("/simulation/status")); } catch (e: any) { return err(e); } }
 );
 
-server.tool("rs_set_sim_speed", "Set simulation speed multiplier",
-  { speed: z.number().describe("Speed multiplier (1.0 = normal)") },
-  async ({ speed }) => { try {
-    return ok(await bridge("/simulation/speed", "POST", { speed }));
+server.tool("rs_set_sim_speed",
+  "Set the simulation speed: a multiplier, or 'As fast as possible' (fullSpeed). " +
+  "Setting only 'speed' leaves 'As fast as possible'.",
+  {
+    speed: z.number().positive().optional()
+      .describe("Speed multiplier (1.0 = real time)"),
+    fullSpeed: z.boolean().optional()
+      .describe("true = As fast as possible; false = use the multiplier"),
+  },
+  async ({ speed, fullSpeed }) => { try {
+    if (speed === undefined && fullSpeed === undefined)
+      throw new Error("Provide speed and/or fullSpeed");
+    return ok(await bridge("/simulation/speed", "POST", { speed, fullSpeed }));
   } catch (e: any) { return err(e); } }
 );
 
@@ -728,7 +745,7 @@ server.tool("rws_read_module", "Read RAPID module text via RWS",
 
 // ── rws_write_module (ENHANCED: RAPID validation) ──
 
-server.tool("rws_write_module", "Write RAPID module text via RWS (auto-mastership). Validates RAPID syntax before upload.",
+server.tool("rws_write_module", "MODIFIES THE RAPID PROGRAM. Write RAPID module text via RWS: the text is uploaded to a temporary file in $HOME and loaded in the task, replacing the module of the same name. Write access: mastership (RobotWare 6 / 7) or remote control station (RobotWare 8; refused while another control station, e.g. the FlexPendant, holds write access). Validates RAPID syntax before upload. The module file the system loads at reset (SYS.cfg) is not changed.",
   {
     task: z.string(), module: z.string(), code: z.string(),
     skipValidation: z.boolean().optional().describe("Skip RAPID syntax validation (default: false)"),
@@ -737,14 +754,11 @@ server.tool("rws_write_module", "Write RAPID module text via RWS (auto-mastershi
     // Validate RAPID syntax first
     const v = validateOrReject(code, skipValidation);
     if (!v.valid) return err(new Error(JSON.stringify(v.error, null, 2)), "RAPID Validation");
-
-    await mastershipRequest("rapid");
-    try {
-      const r = await rws("POST",
-        `/rw/rapid/tasks/${task}/modules/${module}/text?action=set`,
-        `module-text=${encodeURIComponent(code)}`, "application/x-www-form-urlencoded");
-      return ok({ result: r.status === 204 ? `Module ${module} updated` : r.body });
-    } finally { await mastershipRelease("rapid").catch(() => {}); }
+    const declared = code.match(/^\s*MODULE\s+(\w+)/im)?.[1];
+    if (declared && declared.toLowerCase() !== module.toLowerCase()) {
+      return err(new Error(`The code declares MODULE ${declared}, not ${module}`), "RAPID Validation");
+    }
+    return ok(await uploadLargeModule(task, module, code));
   } catch (e: any) { return err(e); } }
 );
 
@@ -765,7 +779,7 @@ function validateControllerPath(filepath: string): string {
   return filepath;
 }
 
-server.tool("rws_load_module_from_file", "Load a RAPID module from a file on the controller filesystem via RWS",
+server.tool("rws_load_module_from_file", "MODIFIES THE RAPID PROGRAM. Load a RAPID module from a file on the controller filesystem via RWS. Write access: mastership (RobotWare 6 / 7) or remote control station (RobotWare 8; refused while another control station, e.g. the FlexPendant, holds write access).",
   {
     task: z.string().describe("Task name, e.g. 'T_ROB1'"),
     filepath: z.string().describe("Path on controller, e.g. '$HOME/my_module.mod'"),
@@ -773,28 +787,19 @@ server.tool("rws_load_module_from_file", "Load a RAPID module from a file on the
   },
   async ({ task, filepath, replace }) => { try {
     const safePath = validateControllerPath(filepath);
-    await mastershipRequest("rapid");
-    try {
-      const r = await rwsPostForm(`/rw/rapid/tasks/${task}?action=loadmod`, {
-        modulepath: safePath,
-        replace: replace !== false ? "true" : "false",
-      });
-      return ok({ result: r.status === 204 ? `Module loaded from ${safePath}` : r.body });
-    } finally { await mastershipRelease("rapid").catch(() => {}); }
+    const r = await withRapidWriteAccess(() => loadModule(task, safePath, replace !== false));
+    return ok({ result: r.status < 300 ? `Module loaded from ${safePath}` : r.body });
   } catch (e: any) { return err(e); } }
 );
 
-server.tool("rws_unload_module", "Unload (delete) a RAPID module from a task via RWS",
+server.tool("rws_unload_module", "MODIFIES THE RAPID PROGRAM. Unload (delete) a RAPID module from a task via RWS. Write access: mastership (RobotWare 6 / 7) or remote control station (RobotWare 8; refused while another control station, e.g. the FlexPendant, holds write access).",
   {
     task: z.string().describe("Task name, e.g. 'T_ROB1'"),
     module: z.string().describe("Module name to unload"),
   },
   async ({ task, module }) => { try {
-    await mastershipRequest("rapid");
-    try {
-      const r = await rwsPostForm(`/rw/rapid/tasks/${task}?action=unloadmod`, { module });
-      return ok({ result: r.status === 204 ? `Module ${module} unloaded` : r.body });
-    } finally { await mastershipRelease("rapid").catch(() => {}); }
+    const r = await withRapidWriteAccess(() => unloadModule(task, module));
+    return ok({ result: r.status < 300 ? `Module ${module} unloaded` : r.body });
   } catch (e: any) { return err(e); } }
 );
 
@@ -847,16 +852,11 @@ server.tool("rws_read_variable", "Read a RAPID variable's live runtime value via
   } catch (e: any) { return err(e); } }
 );
 
-server.tool("rws_write_variable", "Write a RAPID variable's live value via RWS",
+server.tool("rws_write_variable", "MODIFIES RAPID DATA. Write a RAPID variable's live value via RWS. Write access: mastership (RobotWare 6 / 7) or remote control station (RobotWare 8; refused while another control station, e.g. the FlexPendant, holds write access).",
   { task: z.string(), module: z.string(), variable: z.string(), value: z.string() },
   async ({ task, module, variable, value }) => { try {
-    await mastershipRequest("rapid");
-    try {
-      const r = await rws("POST",
-        `/rw/rapid/symbol/RAPID/${task}/${module}/${variable}/data?action=set`,
-        `value=${encodeURIComponent(value)}`, "application/x-www-form-urlencoded");
-      return ok({ result: r.status === 204 ? `${variable} = ${value}` : r.body });
-    } finally { await mastershipRelease("rapid").catch(() => {}); }
+    const r = await withRapidWriteAccess(() => setSymbolValue(task, module, variable, value));
+    return ok({ result: r.status < 300 ? `${variable} = ${value}` : r.body });
   } catch (e: any) { return err(e); } }
 );
 

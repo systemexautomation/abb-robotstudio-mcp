@@ -2170,7 +2170,8 @@ namespace ClaudeBridge
                 systemPath = ctrl.SystemPath,
                 runMode = TryGetStringProperty(ctrl, "RunMode") ?? "unknown",
                 simulationState = Simulator.State.ToString(),
-                simulationSpeed = Simulator.SimulationSpeed
+                simulationSpeed = Simulator.SimulationSpeed,
+                fullSpeed = Simulator.FullSpeed
             };
         }
 
@@ -2235,21 +2236,56 @@ namespace ClaudeBridge
             {
                 state = Simulator.State.ToString(),
                 currentTime = Simulator.CurrentTime,
-                simulationSpeed = Simulator.SimulationSpeed
+                simulationSpeed = Simulator.SimulationSpeed,
+                // "As fast as possible" in the Simulation Clock options.
+                // When true, SimulationSpeed is ignored.
+                fullSpeed = Simulator.FullSpeed
             };
         }
 
         private object GetSimulationSpeed()
         {
-            return new { simulationSpeed = Simulator.SimulationSpeed };
+            return new
+            {
+                simulationSpeed = Simulator.SimulationSpeed,
+                fullSpeed = Simulator.FullSpeed
+            };
         }
 
+        // Body: { speed?: number, fullSpeed?: bool }
+        // - fullSpeed true: "As fast as possible" (speed is kept but ignored)
+        // - speed alone: set the multiplier and leave "As fast as possible"
         private object SetSimulationSpeed(string body)
         {
-            var data = JObject.Parse(body);
-            var speed = data["speed"]?.Value<double>() ?? 1.0;
-            Simulator.SimulationSpeed = speed;
-            return new { success = true, message = "Simulation speed set to " + speed };
+            var data = JObject.Parse(string.IsNullOrWhiteSpace(body) ? "{}" : body);
+            var speedToken = data["speed"];
+            var fullToken = data["fullSpeed"];
+            if (speedToken == null && fullToken == null)
+                throw new ArgumentException("Provide 'speed' and/or 'fullSpeed'");
+
+            if (speedToken != null)
+            {
+                var speed = speedToken.Value<double>();
+                if (speed <= 0)
+                    throw new ArgumentException("'speed' must be greater than 0");
+                Simulator.SimulationSpeed = speed;
+            }
+
+            if (fullToken != null)
+                Simulator.FullSpeed = fullToken.Value<bool>();
+            else
+                Simulator.FullSpeed = false;
+
+            var message = Simulator.FullSpeed
+                ? "Simulation set to as fast as possible"
+                : "Simulation speed set to " + Simulator.SimulationSpeed;
+            return new
+            {
+                success = true,
+                message,
+                simulationSpeed = Simulator.SimulationSpeed,
+                fullSpeed = Simulator.FullSpeed
+            };
         }
 
         // ── Position Endpoint ────────────────────────────────
