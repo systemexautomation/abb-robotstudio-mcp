@@ -389,6 +389,19 @@ namespace ClaudeBridge
                 case "/station/logic/library": return GetSmartComponentLibrary();
                 case "/station/save":         return SaveStation();
 
+                // ── Physics & mechanisms ──────────────────────
+                case "/physics/get":          return GetPhysics(query);
+                case "/physics/set":
+                    if (method != "POST") throw new Exception("POST required");
+                    return SetPhysics(body);
+                case "/physics/settings":     return PhysicsSettings(method, body);
+                case "/mechanism/create":
+                    if (method != "POST") throw new Exception("POST required");
+                    return CreateMechanism(body);
+                case "/mechanism/joints":
+                    if (method != "POST") throw new Exception("POST required");
+                    return MechanismJoints(body);
+
                 // ── RAPID ─────────────────────────────────────
                 case "/rapid/tasks":          return GetRapidTasks();
                 case "/rapid/modules":        return GetRapidModules(query["task"]);
@@ -709,7 +722,10 @@ namespace ClaudeBridge
                     if (depth < MaxMaxDepth) Find(child, path, depth + 1);
                 }
             }
-            Find(station, "", 0);
+            if (name.Contains("/"))
+                exact.Add(Tuple.Create(ResolveObject(station, name), name));   // path: no search
+            else
+                Find(station, "", 0);
 
             var candidates = exact.Count > 0 ? exact : partial;
             if (candidates.Count == 0)
@@ -1195,7 +1211,10 @@ namespace ClaudeBridge
                     if (depth < MaxMaxDepth) Find(child, depth + 1);
                 }
             }
-            Find(station, 0);
+            if (sourceName.Contains("/"))
+                part = ResolveObject(station, sourceName) as Part ?? throw new Exception("'" + sourceName + "' is not a Part");
+            else
+                Find(station, 0);
             if (part == null) throw new Exception("No Part named '" + sourceName + "'");
 
             // Expected box (global) from the mesh cache, same indexing as rs_get_object_parts
@@ -1341,7 +1360,10 @@ namespace ClaudeBridge
                     if (depth < MaxMaxDepth) Find(child, depth + 1);
                 }
             }
-            Find(station, 0);
+            if (sourceName.Contains("/"))
+                part = ResolveObject(station, sourceName) as Part ?? throw new Exception("'" + sourceName + "' is not a Part");
+            else
+                Find(station, 0);
             if (part == null) throw new Exception("No Part named '" + sourceName + "'");
 
             var cache = GetBodyBoxes(part, "mesh", 20);
@@ -1621,7 +1643,10 @@ namespace ClaudeBridge
                     if (depth < MaxMaxDepth) Find(child, depth + 1);
                 }
             }
-            Find(station, 0);
+            if (name.Contains("/"))
+                part = ResolveObject(station, name) as Part ?? throw new Exception("'" + name + "' is not a Part");
+            else
+                Find(station, 0);
             if (part == null) throw new Exception("No Part named '" + name + "'");
 
             var before = part.GetBoundingBox(true);

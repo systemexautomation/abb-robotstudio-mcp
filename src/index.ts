@@ -168,7 +168,7 @@ server.tool("rs_get_station_objects", "List objects in the station (robots, tool
 
 server.tool("rs_get_object_parts", "Inspect the internal elements of one station object: child components, parts and their bodies, each with name, global position and bounding box (mm). Bodies also report face count, volume and surface area. Use it to tell sub-elements apart (e.g. several pallets inside one layout part). Read-only.",
   {
-    name: z.string().describe("Object name: exact match (case-insensitive) is preferred, otherwise a unique substring"),
+    name: z.string().describe("Object name: exact match (case-insensitive) is preferred, otherwise a unique substring. A path 'Parent/Child' selects one object when the name is not unique"),
     maxDepth: z.number().int().min(0).max(20).optional().describe("Max depth of children to describe (default: 3)"),
     limit: z.number().int().min(1).max(2000).optional().describe("Max elements described / items listed (default: 200)"),
     mode: z.enum(["tree", "bodies", "clusters"]).optional().describe(
@@ -205,7 +205,7 @@ server.tool("rs_get_object_parts", "Inspect the internal elements of one station
 
 server.tool("rs_create_part_from_body", "MODIFIES THE STATION. Copy one body of a Part (index from rs_get_object_parts mode=bodies) into a new Part whose frame is on a lower corner of the body: X along the long side, Z up, body in +X/+Y. Geometry stays in place; the source body is not removed. One undo step (Ctrl+Z in RobotStudio). Does not save the station.",
   {
-    sourcePart: z.string().describe("Exact name of the source Part"),
+    sourcePart: z.string().describe("Exact name of the source Part, or its path 'Parent/Part'"),
     bodyIndex: z.number().int().min(0).describe("Body index as reported by rs_get_object_parts (firstBodyIndices, source=mesh)"),
     name: z.string().min(1).describe("Name of the new Part (must not already exist)"),
   },
@@ -216,7 +216,7 @@ server.tool("rs_create_part_from_body", "MODIFIES THE STATION. Copy one body of 
 
 server.tool("rs_remove_part_bodies", "MODIFIES THE STATION. Remove bodies from a Part (indices from rs_get_object_parts mode=bodies, source=mesh). All-or-nothing: with expectFootprints, every body must match one footprint or nothing is removed. One undo step (Ctrl+Z). Body indices change afterwards. Does not save the station.",
   {
-    sourcePart: z.string().describe("Exact name of the Part"),
+    sourcePart: z.string().describe("Exact name of the Part, or its path 'Parent/Part'"),
     bodyIndices: z.array(z.number().int().min(0)).min(1).describe("Body indices to remove"),
     expectFootprints: z.array(z.string()).optional().describe("Safety check: XY sizes each body must match, e.g. ['965.2x965.2'] (mm, orientation-free)"),
     sizeTolerance: z.number().min(0).optional().describe("Tolerance in mm for expectFootprints (default: 1)"),
@@ -228,7 +228,7 @@ server.tool("rs_remove_part_bodies", "MODIFIES THE STATION. Remove bodies from a
 
 server.tool("rs_set_part_frame", "MODIFIES THE STATION. Move a Part's local frame to a new pose without moving its geometry (bodies keep their global pose). Pose in station coordinates: origin in mm, xAxis and zAxis as perpendicular direction vectors; Y = Z x X. One undo step (Ctrl+Z). Does not save the station.",
   {
-    name: z.string().describe("Exact name of the Part"),
+    name: z.string().describe("Exact name of the Part, or its path 'Parent/Part'"),
     origin: z.array(z.number()).length(3).describe("New frame origin [x,y,z] in mm, station coordinates"),
     xAxis: z.array(z.number()).length(3).describe("New X axis direction [x,y,z], station coordinates"),
     zAxis: z.array(z.number()).length(3).describe("New Z axis direction [x,y,z], perpendicular to xAxis"),
@@ -286,6 +286,89 @@ server.tool("rs_transform_part", "MODIFIES THE STATION. Move a whole Part rigidl
 );
 
 server.tool("rs_get_smartcomponent_library", "List the built-in SmartComponents (Source, Sink, LinearMover2, Attacher, LogicGate, Timer...) that rs_edit_station_logic can create with op=create + library.", {},
+// ── Physics & mechanisms ────────────────────────────────────────────────────
+
+server.tool("rs_get_physics", "Read the physics properties of one station object (name, or path 'Parent/Child' when the name is not unique): motion control (None, Static, Kinematic, Dynamic), and for a Part its physics material and collision geometry setting. Also returns the station physics settings (gravity, floor). Read-only.",
+  { name: z.string().min(1).describe("Object name, or path 'Parent/Child'") },
+  async ({ name }) => { try {
+    return ok(await bridge(`/physics/get?name=${encodeURIComponent(name)}`));
+  } catch (e: any) { return err(e); } }
+);
+
+const physicsMaterial = z.object({
+  SurfaceRoughness: z.number().optional().describe("Friction coefficient of the surface"),
+  SurfaceViscosity: z.number().optional(),
+  SurfaceAdhesion: z.number().optional(),
+  SurfaceAdhesionOverlap: z.number().optional(),
+  Density: z.number().optional().describe("kg/m3"),
+  Damping: z.number().optional(),
+  Restitution: z.number().optional().describe("Bounce, 0..1"),
+  PoissonsRatio: z.number().optional(),
+  YoungsModulus: z.number().optional(),
+}).strict();
+
+server.tool("rs_set_physics", "MODIFIES THE STATION. Set physics properties of station objects (names, or paths 'Parent/Child'): motionControl (None = no physics, Static = fixed obstacle, Kinematic = moved by the simulation and pushes dynamic objects, Dynamic = moved by gravity and contacts), and for Parts the physics material (fields not given keep their value) and useOriginalGeometry (exact geometry instead of the simplified collision shape). One undo step (Ctrl+Z). Does not save the station.",
+  {
+    objects: z.array(z.string().min(1)).min(1).describe("Object names or paths"),
+    motionControl: z.enum(["None", "Static", "Kinematic", "Dynamic"]).optional(),
+    material: physicsMaterial.optional(),
+    useOriginalGeometry: z.boolean().optional(),
+  },
+  async (args) => { try {
+    return ok(await bridge("/physics/set", "POST", args, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_physics_settings", "Read the station physics settings (gravity in m/s2, floor on/off and height in mm). With any argument given: MODIFIES THE STATION (one undo step, not saved).",
+  {
+    gravity: z.number().optional().describe("m/s2"),
+    floor: z.boolean().optional(),
+    floorHeight: z.number().optional().describe("mm"),
+  },
+  async (args) => { try {
+    const set = Object.keys(args).length > 0;
+    return ok(await bridge("/physics/settings", set ? "POST" : "GET", set ? args : undefined));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_create_mechanism", "MODIFIES THE STATION. Build a mechanism from existing Parts (each link = one Part, given by name or path) with prismatic or rotational joints, like RobotStudio's Create Mechanism. Joint axes are 2 points in mm, station coordinates, at the current pose of the parts. Limits and poses in mm (prismatic) or degrees (rotational). Optional named poses (for PoseMover), parent SmartComponent, and attachment to a robot flange (mount=false keeps the current position). Link parts still present after compilation are reported, not deleted. One undo step (Ctrl+Z). Does not save the station.",
+  {
+    name: z.string().min(1),
+    type: z.enum(["Other", "Tool", "ExternalAxis"]).optional().describe("Default Other (device)"),
+    parent: z.string().optional().describe("SmartComponent (name or path) that will hold the mechanism; default the station"),
+    links: z.array(z.object({ name: z.string().min(1), part: z.string().min(1) })).min(2),
+    baseLink: z.string().min(1),
+    joints: z.array(z.object({
+      name: z.string().min(1),
+      parent: z.string().min(1).describe("Parent link name"),
+      child: z.string().min(1).describe("Child link name"),
+      type: z.enum(["Prismatic", "Rotational"]),
+      axisStart: z.array(z.number()).length(3),
+      axisEnd: z.array(z.number()).length(3),
+      min: z.number().optional(),
+      max: z.number().optional(),
+    })).min(1),
+    poses: z.record(z.string(), z.array(z.number())).optional().describe("Named poses, e.g. {\"Retracted\":[0],\"Extended\":[198.2]}"),
+    attachToFlangeOf: z.string().optional().describe("Robot mechanism name (or path) to attach the new mechanism to"),
+    mount: z.boolean().optional().describe("true = move the mechanism onto the flange; false (default) = keep its position"),
+  },
+  async (args) => { try {
+    return ok(await bridge("/mechanism/create", "POST", args, 120000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_mechanism_joints", "Read the joint values, limits and named poses of a mechanism (name or path). With limits / poses: MODIFIES the mechanism (one undo step, station not saved): limits = one [min,max] per joint (mm / degrees), null keeps a joint; poses = named joint values added or replaced, null removes a pose. With values: MOVES the mechanism to these joint values (mm / degrees), like jogging; not an undo step.",
+  {
+    name: z.string().min(1),
+    values: z.array(z.number()).optional(),
+    limits: z.array(z.tuple([z.number(), z.number()]).nullable()).optional(),
+    poses: z.record(z.string(), z.array(z.number()).nullable()).optional(),
+  },
+  async (args) => { try {
+    return ok(await bridge("/mechanism/joints", "POST", args, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
   async () => { try { return ok(await bridge("/station/logic/library")); } catch (e: any) { return err(e); } }
 );
 
