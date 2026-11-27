@@ -1,15 +1,17 @@
 # ABB RobotStudio MCP Server — LiskinLabs Edition
 
-> **v3.1.0 (Safety-First & Hardened Edition)** — Advanced MCP server for ABB RobotStudio and ABB robot controllers with TcpListener transport, 66 MCP tools, AutoLoad, RAPID syntax validator, pre-simulation safety guards, and path-traversal protection.
+> **v3.1.0 (Safety-First & Hardened Edition)** — Advanced MCP server for ABB RobotStudio and ABB robot controllers with TcpListener transport, 83 MCP tools, AutoLoad, RAPID syntax validator, pre-simulation safety guards, and path-traversal protection.
 
 Model Context Protocol (MCP) server for ABB RobotStudio (desktop application) and ABB robot controllers (OmniCore / IRC5 / Virtual Controllers).
 
-Exposes **66 tools** across two transports:
+Exposes **83 tools** across two transports:
 
-- **`rs_*`** (33 tools) — RobotStudio SDK via TcpListener in-process Add-In. Inspect/edit stations, targets, paths, modules, variables, I/O signals, configs. Drive simulation with safety guards. Capture screenshots.
-- **`rws_*`** (30 tools) — Robot Web Services REST API direct to controller. Motors, program execution, I/O signals, filesystem, mastership, event log, runtime target controller switching.
+- **`rs_*`** (51 tools) — RobotStudio SDK via TcpListener in-process Add-In. Inspect/edit stations, targets, paths, modules, variables, I/O signals, configs. Drive simulation with safety guards. Capture screenshots.
+- **`rws_*`** (32 tools) — Robot Web Services REST API direct to controller. Motors, program execution and program pointer, I/O signals, filesystem, mastership / RobotWare 8 control station write access, event log, runtime target controller switching.
 
-Tested with: **ABB RobotStudio 2025 + Virtual Controller (IRC5 / OmniCore)** on Windows 11 x64.
+Tested with: **ABB RobotStudio 2026 (26.2) + Virtual Controller (RobotWare 7)** on Windows 11 x64.
+
+> **Installation guide (French): [INSTALLATION.md](INSTALLATION.md)** — prerequisites, build, add-in install, Claude Desktop / Claude Code configuration, troubleshooting.
 
 ---
 
@@ -19,7 +21,7 @@ Tested with: **ABB RobotStudio 2025 + Virtual Controller (IRC5 / OmniCore)** on 
 |---|---|---|
 | HTTP Transport | `HttpListener` — requires `netsh urlacl` (Admin) | **`TcpListener`** — zero admin rights required |
 | Tool Count | 50 | **63** (+13 new tools) |
-| Add-In Installation | Manual per-session "Load Add-In" | **AutoLoad** (user-level `Documents\RobotStudio\Addins`) |
+| Add-In Installation | Manual per-session "Load Add-In" | **AutoLoad** (`Bin\Addins` of the RobotStudio install, administrator rights needed once) |
 | RAPID Validation | None (silent syntax failures) | ✅ **`rs_validate_rapid`** (structural AST block check) |
 | Safety Guard | None (sim starts blindly) | ✅ **`rs_check_safety`** + pre-simulation error block |
 | Path Traversal Defense | None | ✅ **`validateControllerPath`** ($SYSTEM protection, `..` filter) |
@@ -51,13 +53,13 @@ dotnet build addin/ClaudeBridge.csproj -c Release
 
 ### 2. Install Add-In to RobotStudio
 
-```powershell
-# Standard installation (installs to Documents\RobotStudio\Addins — NO ADMIN RIGHTS NEEDED):
-powershell -ExecutionPolicy Bypass -File install-addin.ps1
+Close RobotStudio completely first (it locks the DLL), then, in an **administrator** PowerShell:
 
-# Optional system-wide install (requires Administrator elevation):
-powershell -ExecutionPolicy Bypass -File install-addin.ps1 -System
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-addin.ps1 -RobotStudioVersion "2026"
 ```
+
+The script copies `ClaudeBridge.dll` and `ClaudeBridge.rsaddin` to `C:\Program Files (x86)\ABB\RobotStudio 2026\Bin\Addins\ClaudeBridge` and `C:\Program Files (x86)\Common Files\ABB\RobotStudio\Addins\ClaudeBridge`.
 
 ### 3. Configure MCP Client
 
@@ -71,7 +73,7 @@ Add to your MCP client config (`.mcp.json` or `claude_desktop_config.json`):
       "args": ["C:/Projects/01_Robotics/abb-robotstudio-mcp/dist/index.js"],
       "env": {
         "ABB_BRIDGE_URL": "http://localhost:58080",
-        "ABB_RWS_URL": "http://localhost:80",
+        "ABB_RWS_URL": "https://127.0.0.1:80",
         "ABB_RWS_USER": "Default User",
         "ABB_RWS_PASS": "robotics"
       }
@@ -79,6 +81,8 @@ Add to your MCP client config (`.mcp.json` or `claude_desktop_config.json`):
   }
 }
 ```
+
+The RobotStudio 2026 virtual controller serves Robot Web Services over **HTTPS** (self-signed certificate, Basic authentication). The self-signed certificate is accepted only for `127.0.0.1` / `localhost` / `::1`.
 
 ### 4. Launch & Verify
 
@@ -91,23 +95,24 @@ curl http://localhost:58080/ping
 
 ---
 
-## 🛠️ Complete Tool Index (66 Tools)
+## 🛠️ Complete Tool Index (83 Tools)
 
-### SDK Tools (`rs_*`) — 33 tools
+### SDK Tools (`rs_*`) — 51 tools
 - **Connection & Status:** `rs_ping`, `rs_controller_status`, `rs_check_safety`
-- **Station Management:** `rs_get_station`, `rs_get_station_objects`, `rs_get_object_parts`, `rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_save_station`, `rs_get_screenshot`
+- **Station Management:** `rs_get_station`, `rs_get_station_logic`, `rs_get_station_objects`, `rs_get_object_parts`, `rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`, `rs_create_solid_part`, `rs_modify_solid_part`, `rs_transform_part`, `rs_edit_station_logic`, `rs_get_smartcomponent_library`, `rs_list_config_signals`, `rs_create_config_signals`, `rs_save_station`, `rs_get_screenshot`
 - **RAPID Management:** `rs_get_tasks`, `rs_get_modules`, `rs_read_module`, `rs_write_module`, `rs_validate_rapid`
 - **Variables & Data:** `rs_read_variable`, `rs_write_variable`, `rs_list_variables`
 - **I/O Signals:** `rs_get_io_signals`, `rs_read_io_signal`, `rs_write_io_signal`
-- **Simulation Control:** `rs_start_simulation`, `rs_stop_simulation`, `rs_pause_simulation`, `rs_reset_simulation`, `rs_simulation_status`, `rs_set_sim_speed`, `rs_check_collisions`
+- **Simulation Control:** `rs_start_simulation`, `rs_stop_simulation`, `rs_pause_simulation`, `rs_reset_simulation`, `rs_simulation_status`, `rs_set_sim_speed`, `rs_check_collisions`, `rs_create_collision_set`
 - **Motion & Targets:** `rs_get_position`, `rs_get_paths`, `rs_get_path_targets`, `rs_create_path`, `rs_create_target`
 - **Diagnostics & Config:** `rs_get_execution_errors`, `rs_read_config`, `rs_write_config`
+- **Physics & Mechanisms:** `rs_get_physics`, `rs_set_physics`, `rs_physics_settings`, `rs_create_mechanism`, `rs_mechanism_joints`
 
-### RWS Tools (`rws_*`) — 30 tools
+### RWS Tools (`rws_*`) — 32 tools
 - **Controller & Target:** `rws_set_controller_url`, `rws_controller_status`, `rws_restart_controller`
-- **Execution & Safety:** `rws_set_motors`, `rws_start_program`, `rws_stop_program`, `rws_reset_pp`, `rws_execution_state`, `rws_get_speed_override`, `rws_set_speed_override`
+- **Execution & Safety:** `rws_set_motors`, `rws_start_program`, `rws_stop_program`, `rws_reset_pp`, `rws_set_pp_routine`, `rws_execution_state`, `rws_get_speed_override`, `rws_set_speed_override`
 - **RAPID & Modules:** `rws_get_tasks`, `rws_get_modules`, `rws_read_module`, `rws_write_module`, `rws_load_module_from_file`, `rws_unload_module`, `rws_save_program`, `rws_load_program`
-- **Variables & I/O:** `rws_read_variable`, `rws_write_variable`, `rws_get_position`, `rws_get_io_signals`, `rws_read_io`, `rws_write_io`
+- **Variables & I/O:** `rws_read_variable`, `rws_write_variable`, `rws_get_position`, `rws_get_io_signals`, `rws_read_io`, `rws_write_io`, `rws_create_signals`
 - **Filesystem & Logs:** `rws_list_files`, `rws_read_file`, `rws_write_file`, `rws_event_log`
 - **Mastership:** `rws_request_mastership`, `rws_release_mastership`
 

@@ -6,7 +6,7 @@
  */
 
 import { bridge } from "./bridge-client.js";
-import { rws, rwsExtract } from "./rws-client.js";
+import { rwsControllerState, rwsExecutionState, rwsRecentEvents } from "./rws-client.js";
 
 export interface SafetyCheckResult {
   safe: boolean;
@@ -80,13 +80,24 @@ export async function checkExecutionSafety(): Promise<SafetyCheckResult> {
   const details: SafetyCheckResult["details"] = {};
 
   try {
-    // Check controller state
-    const panel = await rws("/rw/panel/ctrlstate");
-    details.controllerState = rwsExtract(panel.body, "ctrlstate");
+    // Check controller state (the motors must be on to start)
+    details.controllerState = await rwsControllerState();
+    if (!details.controllerState) {
+      return { safe: false, reason: "Could not read the controller state", details };
+    }
+    if (details.controllerState !== "motoron") {
+      return {
+        safe: false,
+        reason: `Controller is in "${details.controllerState}": the motors must be on to start`,
+        details,
+      };
+    }
 
     // Check execution state
-    const exec = await rws("/rw/rapid/execution");
-    details.executionState = rwsExtract(exec.body, "ctrlexecstate");
+    details.executionState = (await rwsExecutionState()).state;
+    if (!details.executionState) {
+      return { safe: false, reason: "Could not read the RAPID execution state", details };
+    }
 
     if (details.executionState === "running") {
       return {
@@ -96,27 +107,30 @@ export async function checkExecutionSafety(): Promise<SafetyCheckResult> {
       };
     }
 
-    // Check event log for recent errors
-    const elog = await rws("/rw/elog/0?lang=en&count=10");
-    const titles = elog.body.match(/class="title"[^>]*>([^<]*)</gi) || [];
-    const errorTitles = titles.filter(
-      (t) =>
-        t.includes("Error") ||
-        t.includes("error") ||
-        t.includes("Syntax") ||
-        t.includes("syntax")
-    );
-    details.errorCount = errorTitles.length;
+    // Check the 10 newest event log entries for errors (message type 3)
+    const recent = await rwsRecentEvents(10);
+    const errorEntries = recent.filter((e) => e.type === 3);
+    details.errorCount = errorEntries.length;
+    details.errors = errorEntries.map((e) => ({
+      title: e.title, body: e.description, timestamp: e.timestamp, type: "Error",
+    }));
 
-    if (errorTitles.length > 0) {
+    if (errorEntries.length > 0) {
       return {
         safe: false,
-        reason: `${errorTitles.length} controller error(s) detected in event log`,
+        reason: `${errorEntries.length} error(s) among the 10 newest event log entries: ` +
+          errorEntries.map((e) => `${e.title} (${e.timestamp})`).join("; "),
         details,
       };
     }
 
-    return { safe: true, reason: "Controller ready for execution", details };
+    return {
+      safe: true,
+      reason: recent.length > 0
+        ? "Controller ready for execution"
+        : "Controller ready for execution (event log empty or not read)",
+      details,
+    };
   } catch (e: any) {
     return {
       safe: false,

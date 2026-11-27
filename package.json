@@ -1,7 +1,7 @@
 {
   "name": "abb-robotstudio-mcp",
   "version": "3.1.0",
-  "description": "MCP server for ABB RobotStudio — 66 tools (SDK + RWS), Safety-First, RAPID validator",
+  "description": "MCP server for ABB RobotStudio — 72 tools (SDK + RWS), Safety-First, RAPID validator",
   "type": "module",
   "main": "dist/index.js",
   "bin": "dist/index.js",

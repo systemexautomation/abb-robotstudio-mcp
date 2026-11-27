@@ -16,7 +16,8 @@ import { BRIDGE_URL, getRwsUrl, setRwsUrl, LARGE_MODULE_THRESHOLD } from "./conf
 import { bridge } from "./bridge-client.js";
 import {
   rws, rwsExtract, rwsExtractAll, rwsPostForm,
-  resetRwsSession, mastershipRequest, mastershipRelease,
+  resetRwsSession, withWriteAccess, withRapidWriteAccess, rwsPostAction, RwsError,
+  rwsControllerState, rwsExecutionState, rwsProgramPointer, rwsRecentEvents, rwsIsLocal,
 } from "./rws-client.js";
 import { validateRapidCode } from "./rapid-validator.js";
 import { checkSimulationSafety, checkExecutionSafety } from "./safety-guard.js";
@@ -69,31 +70,38 @@ async function uploadLargeModule(task: string, module: string, code: string): Pr
   if (module.includes("..") || !/^[a-zA-Z0-9_\-]+$/.test(module)) {
     throw new Error(`Invalid module name "${module}" — must contain only [a-zA-Z0-9_-] and no ".."`);
   }
-  const remoteDir = "$HOME/_claude_upload";
-  const remoteFile = `${remoteDir}/${module}.mod`;
+  // Temporary file directly in $HOME (the file service does not create missing directories)
+  const remoteFile = `$HOME/_claude_upload_${module}.modx`;
+  const fileUrl = `/fileservice/${encodeURIComponent(remoteFile)}`;
 
+  // Upload the module text to the controller filesystem
+  await rws("PUT", fileUrl, code, "text/plain");
   try {
-    // Upload .mod file to controller filesystem
-    await rws("PUT", `/fileservice/${encodeURIComponent(remoteFile)}`, code, "text/plain");
-
-    // Request mastership and load module from file
-    await mastershipRequest("rapid");
-    try {
-      const r = await rwsPostForm(`/rw/rapid/tasks/${task}?action=loadmod`, {
-        modulepath: remoteFile,
-        replace: "true",
-      });
-      return { success: true, message: `Module ${module} loaded via RWS file upload (${r.status})` };
-    } finally {
-      await mastershipRelease("rapid").catch(() => {});
-      // Clean up temp file
-      await rws("POST", `/fileservice/${encodeURIComponent(remoteDir)}?action=remove`).catch(() => {});
-    }
-  } catch (e: any) {
-    // Clean up on error
-    try { await rws("POST", `/fileservice/${encodeURIComponent(remoteDir)}?action=remove`); } catch {}
-    throw e;
+    // Load it in the task, replacing the module of the same name
+    // (mastership on RobotWare 6 / 7, control station write access on RobotWare 8)
+    const r = await withRapidWriteAccess(() => loadModule(task, remoteFile, true));
+    return { success: true, message: `Module ${module} loaded via RWS file upload (${r.status})` };
+  } finally {
+    // Clean up the temp file
+    await rws("DELETE", fileUrl).catch(() => {});
   }
+}
+
+// RAPID task actions, RWS 2 route first (RobotWare 8), then RWS 1 (RobotWare 6 / 7).
+// The caller holds the write access.
+function loadModule(task: string, modulepath: string, replace: boolean) {
+  return rwsPostAction(`/rw/rapid/tasks/${task}/loadmod`, `/rw/rapid/tasks/${task}?action=loadmod`,
+    { modulepath, replace: replace ? "true" : "false" });
+}
+
+function unloadModule(task: string, module: string) {
+  return rwsPostAction(`/rw/rapid/tasks/${task}/unloadmod`, `/rw/rapid/tasks/${task}?action=unloadmod`,
+    { module });
+}
+
+function setSymbolValue(task: string, module: string, variable: string, value: string) {
+  const sym = `/rw/rapid/symbol/RAPID/${task}/${module}/${variable}/data`;
+  return rwsPostAction(sym, `${sym}?action=set`, { value });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -123,6 +131,24 @@ server.tool("rs_get_station", "Get active RobotStudio station info (name, contro
   async () => { try { return ok(await bridge("/station")); } catch (e: any) { return err(e); } }
 );
 
+server.tool("rs_get_station_logic", "Read-only view of the Station Logic: station-level I/O signals, I/O connections and property bindings; every SmartComponent with its properties, signals, internal connections/bindings and child components; the RAPID work objects (wobjdata) of every task, with user and object frames as placed in the station; and the station frames (Paths & Targets > Frames). Poses: global position (mm) and Euler ZYX (deg).",
+  {
+    component: z.string().optional().describe("Only SmartComponents whose name contains this (case-insensitive). Station Logic is always returned"),
+    properties: z.boolean().optional().describe("Include SmartComponent properties (default: true)"),
+    frames: z.boolean().optional().describe("Include work objects and station frames (default: true)"),
+    frameFilter: z.string().optional().describe("Only work objects and frames whose name contains this, e.g. 'Frame_Place_'"),
+  },
+  async ({ component, properties, frames, frameFilter }) => { try {
+    const q = new URLSearchParams();
+    if (component) q.set("component", component);
+    if (properties === false) q.set("properties", "false");
+    if (frames === false) q.set("frames", "false");
+    if (frameFilter) q.set("frameFilter", frameFilter);
+    const qs = toBridgeQuery(q);
+    return ok(await bridge(`/station/logic${qs ? "?" + qs : ""}`, "GET", undefined, 30000));
+  } catch (e: any) { return err(e); } }
+);
+
 server.tool("rs_get_station_objects", "List objects in the station (robots, tools, parts, smart components) with their tree path. Use nameFilter to search by name and limit to cap the result size. Set bbox=true for global position and bounding box (mm). Response reports matchedCount and truncated.",
   {
     bbox: z.boolean().optional().describe("Include global position and bounding box in mm (default: false)"),
@@ -143,7 +169,7 @@ server.tool("rs_get_station_objects", "List objects in the station (robots, tool
 
 server.tool("rs_get_object_parts", "Inspect the internal elements of one station object: child components, parts and their bodies, each with name, global position and bounding box (mm). Bodies also report face count, volume and surface area. Use it to tell sub-elements apart (e.g. several pallets inside one layout part). Read-only.",
   {
-    name: z.string().describe("Object name: exact match (case-insensitive) is preferred, otherwise a unique substring"),
+    name: z.string().describe("Object name: exact match (case-insensitive) is preferred, otherwise a unique substring. A path 'Parent/Child' selects one object when the name is not unique"),
     maxDepth: z.number().int().min(0).max(20).optional().describe("Max depth of children to describe (default: 3)"),
     limit: z.number().int().min(1).max(2000).optional().describe("Max elements described / items listed (default: 200)"),
     mode: z.enum(["tree", "bodies", "clusters"]).optional().describe(
@@ -180,7 +206,7 @@ server.tool("rs_get_object_parts", "Inspect the internal elements of one station
 
 server.tool("rs_create_part_from_body", "MODIFIES THE STATION. Copy one body of a Part (index from rs_get_object_parts mode=bodies) into a new Part whose frame is on a lower corner of the body: X along the long side, Z up, body in +X/+Y. Geometry stays in place; the source body is not removed. One undo step (Ctrl+Z in RobotStudio). Does not save the station.",
   {
-    sourcePart: z.string().describe("Exact name of the source Part"),
+    sourcePart: z.string().describe("Exact name of the source Part, or its path 'Parent/Part'"),
     bodyIndex: z.number().int().min(0).describe("Body index as reported by rs_get_object_parts (firstBodyIndices, source=mesh)"),
     name: z.string().min(1).describe("Name of the new Part (must not already exist)"),
   },
@@ -191,13 +217,200 @@ server.tool("rs_create_part_from_body", "MODIFIES THE STATION. Copy one body of 
 
 server.tool("rs_remove_part_bodies", "MODIFIES THE STATION. Remove bodies from a Part (indices from rs_get_object_parts mode=bodies, source=mesh). All-or-nothing: with expectFootprints, every body must match one footprint or nothing is removed. One undo step (Ctrl+Z). Body indices change afterwards. Does not save the station.",
   {
-    sourcePart: z.string().describe("Exact name of the Part"),
+    sourcePart: z.string().describe("Exact name of the Part, or its path 'Parent/Part'"),
     bodyIndices: z.array(z.number().int().min(0)).min(1).describe("Body indices to remove"),
     expectFootprints: z.array(z.string()).optional().describe("Safety check: XY sizes each body must match, e.g. ['965.2x965.2'] (mm, orientation-free)"),
     sizeTolerance: z.number().min(0).optional().describe("Tolerance in mm for expectFootprints (default: 1)"),
   },
   async ({ sourcePart, bodyIndices, expectFootprints, sizeTolerance }) => { try {
     return ok(await bridge("/station/part/remove-bodies", "POST", { sourcePart, bodyIndices, expectFootprints, sizeTolerance }, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_set_part_frame", "MODIFIES THE STATION. Move a Part's local frame to a new pose without moving its geometry (bodies keep their global pose). Pose in station coordinates: origin in mm, xAxis and zAxis as perpendicular direction vectors; Y = Z x X. One undo step (Ctrl+Z). Does not save the station.",
+  {
+    name: z.string().describe("Exact name of the Part, or its path 'Parent/Part'"),
+    origin: z.array(z.number()).length(3).describe("New frame origin [x,y,z] in mm, station coordinates"),
+    xAxis: z.array(z.number()).length(3).describe("New X axis direction [x,y,z], station coordinates"),
+    zAxis: z.array(z.number()).length(3).describe("New Z axis direction [x,y,z], perpendicular to xAxis"),
+  },
+  async ({ name, origin, xAxis, zAxis }) => { try {
+    return ok(await bridge("/station/part/set-frame", "POST", { name, origin, xAxis, zAxis }, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
+const solidShape = z.enum(["box", "cylinder", "cone", "sphere", "pyramid"]);
+const solidDims = {
+  shape: solidShape.describe("Solid type: box, cylinder, cone, sphere or pyramid"),
+  size: z.array(z.number().positive()).length(3).optional().describe("box: [length (X), width (Y), height (Z)] in mm"),
+  radius: z.number().positive().optional().describe("cylinder, cone (base radius) or sphere: radius in mm"),
+  height: z.number().positive().optional().describe("cylinder, cone or pyramid: height in mm"),
+  topRadius: z.number().min(0).optional().describe("cone: top radius in mm (frustum); omit for a pointed cone"),
+  baseSize: z.number().positive().optional().describe("pyramid: distance from the base centre to a base corner in mm (a 4-sided pyramid of baseSize 80 has a square base of side 113.1)"),
+  sides: z.number().int().min(3).optional().describe("pyramid: number of base sides (default 4)"),
+};
+
+server.tool("rs_create_solid_part", "MODIFIES THE STATION. Create a new Part holding one simple solid (box, cylinder, cone, sphere or pyramid), dimensions in mm. The Part frame is the given pose (default: station origin, axes aligned). The solid is built in that frame: box = corner at the origin, extending along +X/+Y/+Z; cylinder/cone/pyramid = base centre at the origin, height along +Z; sphere = centre at the origin. The result reports the real bounding box and whether the extents match. One undo step (Ctrl+Z). Does not save the station.",
+  {
+    name: z.string().min(1).describe("Name of the new Part (must not already exist)"),
+    ...solidDims,
+    origin: z.array(z.number()).length(3).optional().describe("Frame origin [x,y,z] in mm, station coordinates (default [0,0,0])"),
+    xAxis: z.array(z.number()).length(3).optional().describe("Frame X axis direction (default [1,0,0])"),
+    zAxis: z.array(z.number()).length(3).optional().describe("Frame Z axis direction, perpendicular to xAxis (default [0,0,1])"),
+  },
+  async (args) => { try {
+    return ok(await bridge("/station/part/create-solid", "POST", args, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_modify_solid_part", "MODIFIES THE STATION. Replace the geometry of an existing Part by a new simple solid (box, cylinder, cone, sphere or pyramid, dimensions in mm), keeping its name, frame and references (SmartComponent properties, parents). The solid is built in the Part's current frame with the same conventions as rs_create_solid_part. Refuses a Part with several bodies (imported CAD) unless force=true. One undo step (Ctrl+Z). Does not save the station.",
+  {
+    name: z.string().min(1).describe("Exact name of the existing Part"),
+    ...solidDims,
+    force: z.boolean().optional().describe("Replace even when the Part has several bodies (default false)"),
+  },
+  async (args) => { try {
+    return ok(await bridge("/station/part/modify-solid", "POST", args, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_transform_part", "MODIFIES THE STATION. Move a whole Part rigidly (frame AND geometry together, unlike rs_set_part_frame): first rotate it by rotateZ degrees about the vertical axis through pivot (default: the Part frame origin), then translate it. Use it to turn a Part by 90 degrees. Read the exact result with rs_get_object_parts mode=bodies source=faces. One undo step (Ctrl+Z). Does not save the station.",
+  {
+    name: z.string().min(1).describe("Exact name of the Part"),
+    rotateZ: z.number().optional().describe("Rotation in degrees about the vertical axis (counter-clockwise seen from above)"),
+    pivot: z.array(z.number()).length(2).optional().describe("Rotation centre [x,y] in mm, station coordinates (default: the Part frame origin)"),
+    translate: z.array(z.number()).length(3).optional().describe("Translation [dx,dy,dz] in mm applied after the rotation"),
+  },
+  async (args) => { try {
+    return ok(await bridge("/station/part/transform", "POST", args, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
+// ── Physics & mechanisms ────────────────────────────────────────────────────
+
+server.tool("rs_get_physics", "Read the physics properties of one station object (name, or path 'Parent/Child' when the name is not unique): motion control (None, Static, Kinematic, Dynamic), and for a Part its physics material and collision geometry setting. Also returns the station physics settings (gravity, floor). Read-only.",
+  { name: z.string().min(1).describe("Object name, or path 'Parent/Child'") },
+  async ({ name }) => { try {
+    return ok(await bridge(`/physics/get?name=${encodeURIComponent(name)}`));
+  } catch (e: any) { return err(e); } }
+);
+
+const physicsMaterial = z.object({
+  SurfaceRoughness: z.number().optional().describe("Friction coefficient of the surface"),
+  SurfaceViscosity: z.number().optional(),
+  SurfaceAdhesion: z.number().optional(),
+  SurfaceAdhesionOverlap: z.number().optional(),
+  Density: z.number().optional().describe("kg/m3"),
+  Damping: z.number().optional(),
+  Restitution: z.number().optional().describe("Bounce, 0..1"),
+  PoissonsRatio: z.number().optional(),
+  YoungsModulus: z.number().optional(),
+}).strict();
+
+server.tool("rs_set_physics", "MODIFIES THE STATION. Set physics properties of station objects (names, or paths 'Parent/Child'): motionControl (None = no physics, Static = fixed obstacle, Kinematic = moved by the simulation and pushes dynamic objects, Dynamic = moved by gravity and contacts), and for Parts the physics material (fields not given keep their value) and useOriginalGeometry (exact geometry instead of the simplified collision shape). One undo step (Ctrl+Z). Does not save the station.",
+  {
+    objects: z.array(z.string().min(1)).min(1).describe("Object names or paths"),
+    motionControl: z.enum(["None", "Static", "Kinematic", "Dynamic"]).optional(),
+    material: physicsMaterial.optional(),
+    useOriginalGeometry: z.boolean().optional(),
+  },
+  async (args) => { try {
+    return ok(await bridge("/physics/set", "POST", args, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_physics_settings", "Read the station physics settings (gravity in m/s2, floor on/off and height in mm). With any argument given: MODIFIES THE STATION (one undo step, not saved).",
+  {
+    gravity: z.number().optional().describe("m/s2"),
+    floor: z.boolean().optional(),
+    floorHeight: z.number().optional().describe("mm"),
+  },
+  async (args) => { try {
+    const set = Object.keys(args).length > 0;
+    return ok(await bridge("/physics/settings", set ? "POST" : "GET", set ? args : undefined));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_create_mechanism", "MODIFIES THE STATION. Build a mechanism from existing Parts (each link = one Part, given by name or path) with prismatic or rotational joints, like RobotStudio's Create Mechanism. Joint axes are 2 points in mm, station coordinates, at the current pose of the parts. Limits and poses in mm (prismatic) or degrees (rotational). Optional named poses (for PoseMover), parent SmartComponent, and attachment to a robot flange (mount=false keeps the current position). Link parts still present after compilation are reported, not deleted. One undo step (Ctrl+Z). Does not save the station.",
+  {
+    name: z.string().min(1),
+    type: z.enum(["Other", "Tool", "ExternalAxis"]).optional().describe("Default Other (device)"),
+    parent: z.string().optional().describe("SmartComponent (name or path) that will hold the mechanism; default the station"),
+    links: z.array(z.object({ name: z.string().min(1), part: z.string().min(1) })).min(2),
+    baseLink: z.string().min(1),
+    joints: z.array(z.object({
+      name: z.string().min(1),
+      parent: z.string().min(1).describe("Parent link name"),
+      child: z.string().min(1).describe("Child link name"),
+      type: z.enum(["Prismatic", "Rotational"]),
+      axisStart: z.array(z.number()).length(3),
+      axisEnd: z.array(z.number()).length(3),
+      min: z.number().optional(),
+      max: z.number().optional(),
+    })).min(1),
+    poses: z.record(z.string(), z.array(z.number())).optional().describe("Named poses, e.g. {\"Retracted\":[0],\"Extended\":[198.2]}"),
+    attachToFlangeOf: z.string().optional().describe("Robot mechanism name (or path) to attach the new mechanism to"),
+    mount: z.boolean().optional().describe("true = move the mechanism onto the flange; false (default) = keep its position"),
+  },
+  async (args) => { try {
+    return ok(await bridge("/mechanism/create", "POST", args, 120000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_mechanism_joints", "Read the joint values, limits and named poses of a mechanism (name or path). With limits / poses: MODIFIES the mechanism (one undo step, station not saved): limits = one [min,max] per joint (mm / degrees), null keeps a joint; poses = named joint values added or replaced, null removes a pose. With values: MOVES the mechanism to these joint values (mm / degrees), like jogging; not an undo step.",
+  {
+    name: z.string().min(1),
+    values: z.array(z.number()).optional(),
+    limits: z.array(z.tuple([z.number(), z.number()]).nullable()).optional(),
+    poses: z.record(z.string(), z.array(z.number()).nullable()).optional(),
+  },
+  async (args) => { try {
+    return ok(await bridge("/mechanism/joints", "POST", args, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_get_smartcomponent_library", "List the built-in SmartComponents (Source, Sink, LinearMover2, Attacher, LogicGate, Timer...) that rs_edit_station_logic can create with op=create + library.", {},
+  async () => { try { return ok(await bridge("/station/logic/library")); } catch (e: any) { return err(e); } }
+);
+
+const logicOp = z.object({
+  op: z.enum(["create", "delete", "rename", "setVisible", "setProperty", "addProperty", "removeProperty", "addSignal", "removeSignal", "connect", "disconnect", "bind", "unbind"]),
+}).passthrough();
+
+server.tool("rs_edit_station_logic",
+  "MODIFIES THE STATION. Edit the Station Logic with a list of operations executed in order, as ONE undo step (Ctrl+Z). If one operation fails the call stops, the components it created are removed, but changes already made to pre-existing components may remain (check with rs_get_station_logic). Does not save the station. " +
+  "Paths are SmartComponent names separated by '/' (e.g. 'Box Manager/BoxCopy'); '' = the station itself. Operations: " +
+  "{op:'create', parent?:path, name, library?:'Source'|... (see rs_get_smartcomponent_library) | copyOf?:path (copy of an existing component, keeps its properties) } (neither = empty SmartComponent); " +
+  "{op:'delete', path}; {op:'rename', path, newName}; {op:'setVisible', name, visible}; " +
+  "{op:'setProperty', path, property, value, unit?:'mm'|'deg'|'m'|'rad'|'s'} (unit converts to SI for Double/Vector3; value for object properties = name or path of the object; Vector3 = [x,y,z]); " +
+  "{op:'addProperty', path, name, type:'Double'|'Boolean'|'Int32'|'String'|'Vector3'|'GraphicComponent'|'IHasTransform'|'IAttachableChild'|'ProjectObject'|'Part'|full type name, value?, description?}; {op:'removeProperty', path, name}; {op:'addSignal', path?, name, type:'DigitalInput'|'DigitalOutput'|'AnalogInput'|'AnalogOutput'|'DigitalGroupInput'|'DigitalGroupOutput', autoReset?}; {op:'removeSignal', path?, name}; " +
+  "{op:'connect'|'disconnect', container?:path, source, sourceSignal, target, targetSignal, allowCycle?} (source/target = child name, '(self)' for the container, '(Station Logic)', or a controller name at station level); " +
+  "{op:'bind'|'unbind', container?:path, source, sourceProperty, target, targetProperty}. Read the result with rs_get_station_logic.",
+  { ops: z.array(logicOp).min(1).describe("Operations, executed in order") },
+  async ({ ops }) => { try {
+    return ok(await bridge("/station/logic/edit", "POST", { ops }, 60000));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_list_config_signals", "List the I/O signals defined in the live controller configuration (EIO_SIGNAL), with type, access and device.",
+  { nameFilter: z.string().optional().describe("Case-insensitive substring of the signal name") },
+  async ({ nameFilter }) => { try {
+    const q = nameFilter ? `?nameFilter=${encodeURIComponent(nameFilter)}` : "";
+    return ok(await bridge(`/controller/config/signals${q}`));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_create_config_signals",
+  "MODIFIES THE CONTROLLER CONFIGURATION. Create I/O signals (EIO_SIGNAL) in the live configuration of the virtual controller. Only missing signals are created; existing ones are never changed. A controller restart is usually required afterwards.",
+  {
+    signals: z.array(z.object({
+      name: z.string(),
+      type: z.enum(["DI", "DO", "AI", "AO", "GI", "GO"]).optional().describe("Default DO"),
+      access: z.string().optional().describe("Default 'All'"),
+    })).min(1),
+  },
+  async ({ signals }) => { try {
+    return ok(await bridge("/controller/config/signals", "POST", { signals }, 60000));
   } catch (e: any) { return err(e); } }
 );
 
@@ -355,14 +568,24 @@ server.tool("rs_reset_simulation", "Reset simulation to start position (stops si
   async () => { try { return ok(await bridge("/simulation/reset", "POST")); } catch (e: any) { return err(e); } }
 );
 
-server.tool("rs_simulation_status", "Get simulation state and time", {},
+server.tool("rs_simulation_status",
+  "Get simulation state, time, speed multiplier and fullSpeed (As fast as possible)", {},
   async () => { try { return ok(await bridge("/simulation/status")); } catch (e: any) { return err(e); } }
 );
 
-server.tool("rs_set_sim_speed", "Set simulation speed multiplier",
-  { speed: z.number().describe("Speed multiplier (1.0 = normal)") },
-  async ({ speed }) => { try {
-    return ok(await bridge("/simulation/speed", "POST", { speed }));
+server.tool("rs_set_sim_speed",
+  "Set the simulation speed: a multiplier, or 'As fast as possible' (fullSpeed). " +
+  "Setting only 'speed' leaves 'As fast as possible'.",
+  {
+    speed: z.number().positive().optional()
+      .describe("Speed multiplier (1.0 = real time)"),
+    fullSpeed: z.boolean().optional()
+      .describe("true = As fast as possible; false = use the multiplier"),
+  },
+  async ({ speed, fullSpeed }) => { try {
+    if (speed === undefined && fullSpeed === undefined)
+      throw new Error("Provide speed and/or fullSpeed");
+    return ok(await bridge("/simulation/speed", "POST", { speed, fullSpeed }));
   } catch (e: any) { return err(e); } }
 );
 
@@ -411,6 +634,20 @@ server.tool("rs_write_config", "Write controller config file",
 
 server.tool("rs_check_collisions", "Run collision check on station objects", {},
   async () => { try { return ok(await bridge("/collision/check")); } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_create_collision_set", "MODIFIES THE STATION. Create an active RobotStudio collision set between two groups of existing graphic objects (names of Parts, Groups or Mechanisms, e.g. the robot against the cell). Colliding objects are highlighted in the graphics window. Objects created during the simulation cannot be put in a set. One undo step (Ctrl+Z). Does not save the station.",
+  {
+    name: z.string().min(1).describe("Name of the collision set"),
+    first: z.array(z.string().min(1)).min(1).describe("Names of the objects of the first group"),
+    second: z.array(z.string().min(1)).min(1).describe("Names of the objects of the second group"),
+    color: z.array(z.number().int().min(0).max(255)).length(3).optional().describe("Highlight color [r,g,b] (default red)"),
+    nearMiss: z.number().min(0).optional().describe("Near-miss distance in mm (default 0 = collisions only)"),
+    replace: z.boolean().optional().describe("Replace an existing set of the same name (default false)"),
+  },
+  async (args) => { try {
+    return ok(await bridge("/collision/set", "POST", args, 30000));
+  } catch (e: any) { return err(e); } }
 );
 
 server.tool("rs_get_position", "Get robot position via SDK", {},
@@ -479,74 +716,257 @@ server.tool("rws_set_controller_url", "Switch RWS target controller at runtime (
 
 server.tool("rws_controller_status", "Get controller state via RWS (opmode, motors, RAPID execution)", {},
   async () => { try {
-    const [panel, opmode, exec] = await Promise.all([
-      rws("/rw/panel/ctrlstate"),
+    const [ctrl, opmode, exec] = await Promise.all([
+      rwsControllerState(),
       rws("/rw/panel/opmode"),
-      rws("/rw/rapid/execution"),
+      rwsExecutionState(),
     ]);
     return ok({
-      controllerState: rwsExtract(panel.body, "ctrlstate"),
+      controllerState: ctrl,
       operatingMode: rwsExtract(opmode.body, "opmode"),
-      executionState: rwsExtract(exec.body, "ctrlexecstate"),
-      cycle: rwsExtract(exec.body, "cycle"),
+      executionState: exec.state,
+      cycle: exec.cycle,
     });
   } catch (e: any) { return err(e); } }
 );
 
-server.tool("rws_set_motors", "Turn motors on/off via RWS (real controller command)",
+// ── Motors and RAPID execution (RWS) ─────────────────────────
+// RobotWare 8 (RWS 2) takes the actions in the path (/rw/rapid/execution/start) and guards
+// writes with the remote control station write access; RobotWare 6 (RWS 1) takes them as
+// ?action= and uses mastership. RobotWare 7 (RWS 2 with /rw/mastership/edit) is not supported
+// yet. rwsPostAction tries the RWS 2 form first; withRapidWriteAccess picks the access.
+
+const DEFAULT_TASK = "T_ROB1";
+// SYS_CTRL_E_PERMISSION_CONTROLLER_STATE_REJECT: "not allowed in current controller state"
+const STATE_REJECT = "-1073445806";
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function rwsErrorCode(e: any): string {
+  if (!(e instanceof RwsError)) return "";
+  return e.body.match(/class="code">\s*(-?\d+)/)?.[1] ?? e.body.match(/code=(-?\d+)/)?.[1] ?? "";
+}
+
+// Start, stop and motors are sent directly first, as ABB's own clients do. Only when the
+// controller refuses for another reason than its state (403, e.g. missing write access) is the
+// command sent again while holding write access, so a stop never waits for write access.
+async function postWithAccessFallback(rws2Path: string, rws1Path: string, params: Record<string, string>) {
+  try {
+    return await rwsPostAction(rws2Path, rws1Path, params);
+  } catch (e) {
+    // Only a refusal with an error code other than the state refusal is sent again: a refused
+    // request was not executed, and an unexplained 403 is not retried
+    const code = rwsErrorCode(e);
+    if (e instanceof RwsError && e.status === 403 && code && code !== STATE_REJECT) {
+      return withRapidWriteAccess(() => rwsPostAction(rws2Path, rws1Path, params));
+    }
+    throw e;
+  }
+}
+
+// Explains a refusal. The guard-stop text is given only for the state refusal of a start or
+// motors-on request on a local controller, and never invites the model to retry on its own.
+async function explainControllerRefusal(e: any, motorsHint = false): Promise<any> {
+  if (!(e instanceof RwsError) || (e.status !== 403 && e.status !== 400)) return e;
+  const code = rwsErrorCode(e);
+  const text = e.body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+  let hint = "";
+  if (code === STATE_REJECT) {
+    const state = await rwsControllerState().catch(() => "");
+    hint = ` The controller state does not allow it${state ? ` (state "${state}")` : ""}.`;
+    if (motorsHint && state === "guardstop") {
+      hint += " On a real controller, guard stop means a safety circuit is open.";
+      if (rwsIsLocal()) {
+        hint += " If this is a RobotStudio virtual controller, it stays in guard stop while the station" +
+          " simulation is stopped. Tell the user: they start the simulation themselves, or turn the" +
+          " motors on from the Control Panel. Starting the simulation may also start RAPID (Simulation" +
+          " Setup), so check rws_execution_state afterwards and start again only with the user's go-ahead.";
+      }
+    }
+  }
+  return new Error(`The controller refused the request (${e.status}${code ? `, code ${code}` : ""}).${hint} (${text})`);
+}
+
+server.tool("rws_set_motors", "MODIFIES THE CONTROLLER STATE: motors on enables robot motion, motors off de-energises the robot. Ask the user before turning motors on. Sent directly; sent again with write access (RobotWare 8 control station, RobotWare 6 mastership) only if the controller asks for it. A RobotStudio virtual controller in guard stop (station simulation stopped) refuses motors on.",
   { state: z.enum(["on", "off"]) },
   async ({ state }) => { try {
-    const r = await rws("POST", "/rw/panel/ctrlstate?action=setctrlstate",
-      `ctrl-state=motor${state}`, "application/x-www-form-urlencoded");
-    return ok({ result: r.status === 204 ? `Motors ${state}` : r.body });
-  } catch (e: any) { return err(e); } }
+    await postWithAccessFallback("/rw/panel/ctrl-state", "/rw/panel/ctrlstate?action=setctrlstate",
+      { "ctrl-state": `motor${state}` });
+    // The state changes asynchronously: read it for up to 2 s
+    let ctrl = "";
+    for (let i = 0; i < 8; i++) {
+      ctrl = await rwsControllerState().catch(() => "");
+      if (ctrl === `motor${state}`) break;
+      await sleep(250);
+    }
+    return ok({
+      result: `Motors ${state} requested`,
+      controllerState: ctrl || "unknown",
+      ...(ctrl === `motor${state}` ? {} : { warning: `The controller did not report motor${state} within 2 s` }),
+    });
+  } catch (e: any) { return err(await explainControllerRefusal(e, state === "on")); } }
 );
-
-// ── RAPID Execution (RWS) ────────────────────────────────────
 
 // ── rws_start_program (ENHANCED: safety guard) ──
 
-server.tool("rws_start_program", "Start RAPID execution on the controller via RWS. Blocks if errors detected — use force=true to override.",
+server.tool("rws_start_program", "MOVES THE ROBOT. Start RAPID execution from the current program pointer via RWS: place it first with rws_set_pp_routine ('PP to Routine') or rws_reset_pp, or use mode=reset. The program keeps running after the tool returns: follow it with rws_execution_state, stop it with rws_stop_program. Use cycle=once for tests. The motors must be on (a RobotStudio virtual controller is in guard stop while the station simulation is stopped). The safety check blocks the start when the motors are not on, when a program is already running, or when one of the 10 newest event log entries is an error; do not set force=true without the user's approval. RobotWare 8 and 6; RobotWare 7 not supported yet.",
   {
-    mode: z.enum(["continue", "reset"]).optional(),
-    force: z.boolean().optional().describe("Skip safety check and force start even with errors (default: false)"),
+    mode: z.enum(["continue", "reset"]).optional().describe("reset = first reset the program pointer of ALL normal tasks to main (it stays reset if the start is then refused). Default: continue from the current program pointer"),
+    cycle: z.enum(["asis", "once", "forever"]).optional().describe("Run mode: once, forever, or asis = keep the controller setting (default: asis)"),
+    waitSeconds: z.number().min(0).max(50).optional().describe("Wait up to this many seconds (max 50) for execution to end, then report the final state, program pointer and newest events (default: 0, return at once)"),
+    task: z.string().optional().describe("Task whose program pointer is reported (default: T_ROB1)"),
+    force: z.boolean().optional().describe("Skip the safety check (needs the user's approval; default: false)"),
   },
-  async ({ mode, force }) => { try {
-    if (!force) {
-      const safety = await checkExecutionSafety();
-      if (!safety.safe) {
-        return err(
-          new Error(`Safety check blocked execution: ${safety.reason}\nHint: Set force=true to override`),
-          "SafetyGuard"
-        );
+  async ({ mode, cycle, waitSeconds, task, force }) => {
+    const t = task ?? DEFAULT_TASK;
+    let ppReset = false;
+    let safetyNote = force ? "Safety check skipped (force=true)" : "";
+    try {
+      if (!force) {
+        const safety = await checkExecutionSafety();
+        if (!safety.safe) {
+          return err(
+            new Error(`Safety check blocked execution: ${safety.reason}\nHint: fix the cause; force=true only with the user's approval`),
+            "SafetyGuard"
+          );
+        }
+        safetyNote = safety.reason ?? "";
       }
+      if (mode === "reset") {
+        await withRapidWriteAccess(() => rwsPostAction(
+          "/rw/rapid/execution/resetpp", "/rw/rapid/execution?action=resetpp", {}));
+        ppReset = true;
+      }
+    } catch (e: any) {
+      return err(await explainControllerRefusal(e));
     }
-    const r = await rws("POST", "/rw/rapid/execution?action=start",
-      `regain=continue&execmode=${mode || "continue"}&cycle=forever&condition=none&stopatbp=disabled&alltaskbytsp=false`,
-      "application/x-www-form-urlencoded");
-    return ok({ result: r.status === 204 ? "Program started" : r.body });
-  } catch (e: any) { return err(e); } }
+    try {
+      await postWithAccessFallback("/rw/rapid/execution/start", "/rw/rapid/execution?action=start", {
+        regain: "continue",
+        execmode: "continue",
+        cycle: cycle ?? "asis",
+        condition: "none",
+        stopatbp: "disabled",
+        alltaskbytsp: "false",
+      });
+    } catch (e: any) {
+      const reset = ppReset ? " The program pointer had already been reset to main." : "";
+      if (!(e instanceof RwsError)) {
+        // No answer (timeout, dropped connection): the controller may have accepted the start
+        return err(new Error(`Start outcome unknown: ${e?.message ?? e}.${reset} Check rws_execution_state; do not send the start again before that.`));
+      }
+      const ex = await explainControllerRefusal(e, true);
+      return err(reset ? new Error(`${ex?.message ?? ex}${reset}`) : ex);
+    }
+
+    // The start was accepted: from here on, a failed read is reported, not raised
+    const result: Record<string, any> = { result: "Program started", safetyCheck: safetyNote };
+    const waitMs = Math.min(waitSeconds ?? 0, 50) * 1000;
+    try {
+      const t0 = Date.now();
+      let exec = await rwsExecutionState();
+      let sawRunning = exec.state === "running";
+      // The start is asynchronous: give the state up to 3 s to become "running"
+      while (!sawRunning && Date.now() - t0 < 3000) {
+        await sleep(250);
+        exec = await rwsExecutionState();
+        sawRunning = exec.state === "running";
+      }
+      while (exec.state === "running" && Date.now() - t0 < waitMs) {
+        await sleep(500);
+        exec = await rwsExecutionState();
+      }
+      result.sawRunning = sawRunning;
+      result.executionState = exec.state;
+      result.cycle = exec.cycle;
+      if (waitMs > 0) {
+        result.finished = sawRunning && exec.state === "stopped";
+        result.waitedSeconds = Math.round((Date.now() - t0) / 100) / 10;
+      }
+      if (exec.state === "running") {
+        result.note = "Running: follow it with rws_execution_state, stop it with rws_stop_program";
+      } else if (!sawRunning) {
+        result.note = "Execution was not seen running: it ended within a fraction of a second, or did" +
+          " not start. Check recentEvents and rws_execution_state; do not start again without the user's go-ahead.";
+      } else {
+        result.note = "Execution stopped: normal end, Stop instruction, error or external stop (see recentEvents)";
+      }
+      if (exec.state !== "running") {
+        result.recentEvents = (await rwsRecentEvents(5).catch(() => []))
+          .map((ev) => ({ type: ev.type, timestamp: ev.timestamp, title: ev.title }));
+      }
+    } catch (e: any) {
+      result.executionState = "unknown";
+      result.warning = `Started, but the execution state could not be read: ${e?.message ?? e}`;
+    }
+    result.programPointer = await rwsProgramPointer(t).catch(() => null);
+    return ok(result);
+  }
 );
 
-server.tool("rws_stop_program", "Stop RAPID execution via RWS", {},
+server.tool("rws_stop_program", "MODIFIES THE EXECUTION STATE. Stop RAPID execution via RWS (normal program stop, not a safety stop). Sent directly; sent again with write access (RobotWare 8 control station, RobotWare 6 mastership) only if the controller asks for it.", {},
   async () => { try {
-    const r = await rws("POST", "/rw/rapid/execution?action=stop",
-      "stopmode=stop&usetsp=normal", "application/x-www-form-urlencoded");
-    return ok({ result: r.status === 204 ? "Program stopped" : r.body });
-  } catch (e: any) { return err(e); } }
+    await postWithAccessFallback("/rw/rapid/execution/stop", "/rw/rapid/execution?action=stop",
+      { stopmode: "stop", usetsp: "normal" });
+    let exec = await rwsExecutionState().catch(() => ({ state: "unknown", cycle: "" }));
+    // The stop is asynchronous: read the state for up to 2 s
+    for (let i = 0; i < 8 && exec.state === "running"; i++) {
+      await sleep(250);
+      exec = await rwsExecutionState().catch(() => ({ state: "unknown", cycle: "" }));
+    }
+    return ok({
+      result: "Stop requested",
+      executionState: exec.state,
+      stopped: exec.state === "stopped",
+      ...(exec.state === "stopped" ? {} : {
+        warning: "Execution is not reported stopped after 2 s: check rws_execution_state; if the robot must stop now, use the FlexPendant or the emergency stop",
+      }),
+    });
+  } catch (e: any) { return err(await explainControllerRefusal(e)); } }
 );
 
-server.tool("rws_reset_pp", "Reset RAPID program pointer via RWS", {},
-  async () => { try {
-    const r = await rws("POST", "/rw/rapid/execution?action=resetpp");
-    return ok({ result: r.status === 204 ? "PP reset" : r.body });
-  } catch (e: any) { return err(e); } }
+server.tool("rws_reset_pp", "MODIFIES THE PROGRAM POINTER. Reset the program pointer of ALL normal tasks to main via RWS. Execution must be stopped. Leaving a routine that has an UNDO handler runs it. Write access: remote control station (RobotWare 8) or mastership (RobotWare 6).",
+  { task: z.string().optional().describe("Task whose new program pointer is reported (default: T_ROB1)") },
+  async ({ task }) => { try {
+    await withRapidWriteAccess(() => rwsPostAction(
+      "/rw/rapid/execution/resetpp", "/rw/rapid/execution?action=resetpp", {}));
+    return ok({ result: "PP reset", programPointer: await rwsProgramPointer(task ?? DEFAULT_TASK).catch(() => null) });
+  } catch (e: any) { return err(await explainControllerRefusal(e)); } }
 );
 
-server.tool("rws_execution_state", "Get RAPID execution state via RWS", {},
-  async () => { try {
-    const r = await rws("/rw/rapid/execution");
-    return ok({ state: rwsExtract(r.body, "ctrlexecstate"), cycle: rwsExtract(r.body, "cycle") });
+server.tool("rws_set_pp_routine", "MODIFIES THE PROGRAM POINTER. Set the program pointer of a task to the start of a routine without parameters, like 'PP to Routine', via RWS. Does not start execution (use rws_start_program). Execution must be stopped. Leaving a routine that has an UNDO handler runs it. Write access: remote control station (RobotWare 8) or mastership (RobotWare 6).",
+  {
+    task: z.string().min(1).describe("Task, e.g. 'T_ROB1'"),
+    module: z.string().min(1).describe("Module that contains the routine"),
+    routine: z.string().min(1).describe("Routine name (PROC without parameters)"),
+  },
+  async ({ task, module, routine }) => { try {
+    await withRapidWriteAccess(() => rwsPostAction(
+      `/rw/rapid/tasks/${encodeURIComponent(task)}/pcp/routine`,
+      `/rw/rapid/tasks/${encodeURIComponent(task)}/pcp?action=set-pp-routine`,
+      { routine, module, userlevel: "false" }));
+    let pp;
+    try {
+      pp = await rwsProgramPointer(task);
+    } catch (e: any) {
+      return ok({ result: "PP request accepted; the program pointer could not be read back", warning: e?.message ?? String(e) });
+    }
+    if (!pp || pp.routine.toLowerCase() !== routine.toLowerCase() || pp.module.toLowerCase() !== module.toLowerCase()) {
+      throw new Error(`The controller accepted the request but the program pointer is ${pp ? `in ${pp.module}/${pp.routine}` : "not set"}`);
+    }
+    return ok({ result: `PP set to ${pp.module}/${pp.routine}`, programPointer: pp });
+  } catch (e: any) { return err(await explainControllerRefusal(e)); } }
+);
+
+server.tool("rws_execution_state", "Get RAPID execution state, run mode and controller state via RWS, and the program pointer of a task (module, routine, line)",
+  { task: z.string().optional().describe("Task whose program pointer is reported (default: T_ROB1)") },
+  async ({ task }) => { try {
+    const exec = await rwsExecutionState();
+    return ok({
+      state: exec.state,
+      cycle: exec.cycle,
+      controllerState: await rwsControllerState().catch(() => ""),
+      programPointer: await rwsProgramPointer(task ?? DEFAULT_TASK).catch(() => null),
+    });
   } catch (e: any) { return err(e); } }
 );
 
@@ -575,14 +995,24 @@ server.tool("rws_read_module", "Read RAPID module text via RWS",
   { task: z.string(), module: z.string() },
   async ({ task, module }) => { try {
     const r = await rws(`/rw/rapid/tasks/${task}/modules/${module}/text`);
-    const text = rwsExtract(r.body, "module-text") || r.body;
-    return ok({ task, module, text });
+    let text = rwsExtract(r.body, "module-text");
+    if (!text) {
+      // RobotWare 7 answers with metadata only: the module text sits in a temporary file
+      // on the controller (e.g. /TEMP/pusres.123) that must be downloaded separately.
+      const filePath = rwsExtract(r.body, "file-path");
+      const m = /^\/?(TEMP|HOME|SYSTEM)\/(.+)$/i.exec(filePath);
+      if (m) {
+        const file = await rws(`/fileservice/${encodeURIComponent(`$${m[1]!.toUpperCase()}/${m[2]}`)}`);
+        text = file.body;
+      }
+    }
+    return ok({ task, module, text: text || r.body });
   } catch (e: any) { return err(e); } }
 );
 
 // ── rws_write_module (ENHANCED: RAPID validation) ──
 
-server.tool("rws_write_module", "Write RAPID module text via RWS (auto-mastership). Validates RAPID syntax before upload.",
+server.tool("rws_write_module", "MODIFIES THE RAPID PROGRAM. Write RAPID module text via RWS: the text is uploaded to a temporary file in $HOME and loaded in the task, replacing the module of the same name. Write access: mastership (RobotWare 6 / 7) or remote control station (RobotWare 8; refused while another control station, e.g. the FlexPendant, holds write access). Validates RAPID syntax before upload. The module file the system loads at reset (SYS.cfg) is not changed.",
   {
     task: z.string(), module: z.string(), code: z.string(),
     skipValidation: z.boolean().optional().describe("Skip RAPID syntax validation (default: false)"),
@@ -591,14 +1021,11 @@ server.tool("rws_write_module", "Write RAPID module text via RWS (auto-mastershi
     // Validate RAPID syntax first
     const v = validateOrReject(code, skipValidation);
     if (!v.valid) return err(new Error(JSON.stringify(v.error, null, 2)), "RAPID Validation");
-
-    await mastershipRequest("rapid");
-    try {
-      const r = await rws("POST",
-        `/rw/rapid/tasks/${task}/modules/${module}/text?action=set`,
-        `module-text=${encodeURIComponent(code)}`, "application/x-www-form-urlencoded");
-      return ok({ result: r.status === 204 ? `Module ${module} updated` : r.body });
-    } finally { await mastershipRelease("rapid").catch(() => {}); }
+    const declared = code.match(/^\s*MODULE\s+(\w+)/im)?.[1];
+    if (declared && declared.toLowerCase() !== module.toLowerCase()) {
+      return err(new Error(`The code declares MODULE ${declared}, not ${module}`), "RAPID Validation");
+    }
+    return ok(await uploadLargeModule(task, module, code));
   } catch (e: any) { return err(e); } }
 );
 
@@ -619,7 +1046,7 @@ function validateControllerPath(filepath: string): string {
   return filepath;
 }
 
-server.tool("rws_load_module_from_file", "Load a RAPID module from a file on the controller filesystem via RWS",
+server.tool("rws_load_module_from_file", "MODIFIES THE RAPID PROGRAM. Load a RAPID module from a file on the controller filesystem via RWS. Write access: mastership (RobotWare 6 / 7) or remote control station (RobotWare 8; refused while another control station, e.g. the FlexPendant, holds write access).",
   {
     task: z.string().describe("Task name, e.g. 'T_ROB1'"),
     filepath: z.string().describe("Path on controller, e.g. '$HOME/my_module.mod'"),
@@ -627,28 +1054,19 @@ server.tool("rws_load_module_from_file", "Load a RAPID module from a file on the
   },
   async ({ task, filepath, replace }) => { try {
     const safePath = validateControllerPath(filepath);
-    await mastershipRequest("rapid");
-    try {
-      const r = await rwsPostForm(`/rw/rapid/tasks/${task}?action=loadmod`, {
-        modulepath: safePath,
-        replace: replace !== false ? "true" : "false",
-      });
-      return ok({ result: r.status === 204 ? `Module loaded from ${safePath}` : r.body });
-    } finally { await mastershipRelease("rapid").catch(() => {}); }
+    const r = await withRapidWriteAccess(() => loadModule(task, safePath, replace !== false));
+    return ok({ result: r.status < 300 ? `Module loaded from ${safePath}` : r.body });
   } catch (e: any) { return err(e); } }
 );
 
-server.tool("rws_unload_module", "Unload (delete) a RAPID module from a task via RWS",
+server.tool("rws_unload_module", "MODIFIES THE RAPID PROGRAM. Unload (delete) a RAPID module from a task via RWS. Write access: mastership (RobotWare 6 / 7) or remote control station (RobotWare 8; refused while another control station, e.g. the FlexPendant, holds write access).",
   {
     task: z.string().describe("Task name, e.g. 'T_ROB1'"),
     module: z.string().describe("Module name to unload"),
   },
   async ({ task, module }) => { try {
-    await mastershipRequest("rapid");
-    try {
-      const r = await rwsPostForm(`/rw/rapid/tasks/${task}?action=unloadmod`, { module });
-      return ok({ result: r.status === 204 ? `Module ${module} unloaded` : r.body });
-    } finally { await mastershipRelease("rapid").catch(() => {}); }
+    const r = await withRapidWriteAccess(() => unloadModule(task, module));
+    return ok({ result: r.status < 300 ? `Module ${module} unloaded` : r.body });
   } catch (e: any) { return err(e); } }
 );
 
@@ -701,16 +1119,11 @@ server.tool("rws_read_variable", "Read a RAPID variable's live runtime value via
   } catch (e: any) { return err(e); } }
 );
 
-server.tool("rws_write_variable", "Write a RAPID variable's live value via RWS",
+server.tool("rws_write_variable", "MODIFIES RAPID DATA. Write a RAPID variable's live value via RWS. Write access: mastership (RobotWare 6 / 7) or remote control station (RobotWare 8; refused while another control station, e.g. the FlexPendant, holds write access).",
   { task: z.string(), module: z.string(), variable: z.string(), value: z.string() },
   async ({ task, module, variable, value }) => { try {
-    await mastershipRequest("rapid");
-    try {
-      const r = await rws("POST",
-        `/rw/rapid/symbol/RAPID/${task}/${module}/${variable}/data?action=set`,
-        `value=${encodeURIComponent(value)}`, "application/x-www-form-urlencoded");
-      return ok({ result: r.status === 204 ? `${variable} = ${value}` : r.body });
-    } finally { await mastershipRelease("rapid").catch(() => {}); }
+    const r = await withRapidWriteAccess(() => setSymbolValue(task, module, variable, value));
+    return ok({ result: r.status < 300 ? `${variable} = ${value}` : r.body });
   } catch (e: any) { return err(e); } }
 );
 
@@ -764,6 +1177,39 @@ server.tool("rws_write_io", "Set an I/O signal value via RWS",
   } catch (e: any) { return err(e); } }
 );
 
+server.tool("rws_create_signals", "MODIFIES THE CONTROLLER CONFIGURATION. Create I/O signals (EIO_SIGNAL instances) through RWS, registering as a remote control station for write access (RobotWare 8). Only missing signals are created; existing ones are left unchanged. The controller must be restarted before the new signals can be used.",
+  {
+    signals: z.array(z.object({
+      name: z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,31}$/).describe("Signal name"),
+      type: z.enum(["DI", "DO", "AI", "AO", "GI", "GO"]).optional().describe("Signal type (default DO)"),
+      access: z.string().optional().describe("Access level (default All)"),
+      device: z.string().optional().describe("I/O device (default none: simulated signal)"),
+    })).min(1),
+  },
+  async ({ signals }) => { try {
+    const path = (n: string) => `/rw/cfg/EIO/EIO_SIGNAL/instances/${encodeURIComponent(n)}`;
+    const exists = async (n: string) => {
+      try { await rws(path(n)); return true; }
+      catch (e) { if (e instanceof RwsError && e.status === 404) return false; throw e; }
+    };
+    const created: string[] = [], existing: string[] = [];
+    await withWriteAccess(async () => {
+      for (const s of signals) {
+        if (await exists(s.name)) { existing.push(s.name); continue; }
+        await rwsPostForm("/rw/cfg/EIO/EIO_SIGNAL/instances/create-default", { name: s.name });
+        const attrs: Record<string, string> = {
+          SignalType: `[${s.type ?? "DO"},1]`,
+          Access: `[${s.access ?? "All"},1]`,
+        };
+        if (s.device) attrs.Device = `[${s.device},1]`;
+        await rwsPostForm(path(s.name), attrs);
+        created.push(s.name);
+      }
+    });
+    return ok({ created, existing, note: created.length ? "Restart the controller to use the new signals." : "Nothing created." });
+  } catch (e: any) { return err(e); } }
+);
+
 // ── Speed Override (RWS) ────────────────────────────────────
 
 server.tool("rws_get_speed_override", "Get speed override percentage via RWS", {},
@@ -784,18 +1230,13 @@ server.tool("rws_set_speed_override", "Set speed override (0-100%) via RWS",
 
 // ── Event Log (RWS) ─────────────────────────────────────────
 
-server.tool("rws_event_log", "Get controller event log via RWS",
-  { count: z.number().optional().describe("Default: 10") },
+server.tool("rws_event_log", "Get the newest entries of the controller event log (common domain) via RWS, newest first. type: 1 information, 2 warning, 3 error",
+  { count: z.number().int().min(1).max(50).optional().describe("Number of entries, 1-50 (default: 10)") },
   async ({ count }) => { try {
-    const r = await rws(`/rw/elog/0?lang=en&count=${count || 10}`);
-    const titles = rwsExtractAll(r.body, "title");
-    const bodies = rwsExtractAll(r.body, "body");
-    const timestamps = rwsExtractAll(r.body, "timestamp");
-    const types = rwsExtractAll(r.body, "msgtype");
-    const entries = titles.map((t, i) => ({
-      title: t, body: bodies[i] ?? "", timestamp: timestamps[i] ?? "", type: types[i] ?? ""
-    }));
-    return ok(entries.length > 0 ? entries : { raw: r.body });
+    const entries = await rwsRecentEvents(count ?? 10);
+    return ok(entries.map((e) => ({
+      seq: e.seq, type: e.type, code: e.code, timestamp: e.timestamp, title: e.title, description: e.description,
+    })));
   } catch (e: any) { return err(e); } }
 );
 
@@ -857,7 +1298,7 @@ async function main() {
   console.error("  SDK Bridge: " + BRIDGE_URL + " (TcpListener, no admin rights)");
   console.error("  RWS:        " + getRwsUrl() + " (runtime-switchable via rws_set_controller_url)");
   console.error("  Safety:     RAPID validation + pre-simulation error guard");
-  console.error("  Tools:      rs_* (36) + rws_* (30) = 66 total");
+  console.error("  Tools:      rs_* (51) + rws_* (32) = 83 total");
   console.error("  RULES:      NEVER run simulation if RAPID errors exist");
 }
 
