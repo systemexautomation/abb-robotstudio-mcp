@@ -395,3 +395,104 @@ export function rwsExtractAll(xml: string, field: string): string[] {
   while ((m = re.exec(xml)) !== null) results.push((m[1] ?? "").trim());
   return results;
 }
+
+// ── Controller and execution state ──────────────────────────
+
+// True when the RWS URL points to this PC (a RobotStudio virtual controller)
+export function rwsIsLocal(): boolean {
+  try {
+    return LOOPBACK_HOSTS.has(new URL(getRwsUrl()).hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+// Controller state: motoron, motoroff, guardstop, emergencystop... (/rw/panel/ctrl-state on
+// RobotWare 8, /rw/panel/ctrlstate on RobotWare 6). When both fail, the first error is thrown.
+export async function rwsControllerState(): Promise<string> {
+  const r = await rws("/rw/panel/ctrl-state").catch((e1) =>
+    rws("/rw/panel/ctrlstate").catch(() => { throw e1; }));
+  return rwsExtract(r.body, "ctrlstate") || rwsExtract(r.body, "ctrl-state");
+}
+
+export async function rwsExecutionState(): Promise<{ state: string; cycle: string }> {
+  const r = await rws("/rw/rapid/execution");
+  return { state: rwsExtract(r.body, "ctrlexecstate"), cycle: rwsExtract(r.body, "cycle") };
+}
+
+export interface ProgramPointer { module: string; routine: string; line: number }
+
+// Program pointer from a GET /rw/rapid/tasks/{task}/pcp answer, or null when the task has none
+// (after a module load, for example). RWS spells the module field "modulemame".
+export function parseProgramPointer(body: string): ProgramPointer | null {
+  const pp = body.match(/title="progpointer"[^>]*>([\s\S]*?)<\/li>/)?.[1] ?? "";
+  const routine = rwsExtract(pp, "routinename");
+  if (!routine) return null;
+  return {
+    module: rwsExtract(pp, "modulemame") || rwsExtract(pp, "modulename"),
+    routine,
+    line: Number(rwsExtract(pp, "beginposition").split(",")[0]) || 0,
+  };
+}
+
+export async function rwsProgramPointer(task: string): Promise<ProgramPointer | null> {
+  const r = await rws(`/rw/rapid/tasks/${encodeURIComponent(task)}/pcp`);
+  return parseProgramPointer(r.body);
+}
+
+// ── Event log ───────────────────────────────────────────────
+
+// type: 1 information, 2 warning, 3 error
+export interface ElogEntry { seq: number; type: number; code: number; timestamp: string; title: string; description: string }
+
+export function parseElog(body: string): ElogEntry[] {
+  const out: ElogEntry[] = [];
+  const re = /<li class="elog-message-li"([\s\S]*?)<\/li>/g;
+  let m;
+  while ((m = re.exec(body)) !== null) {
+    const li = m[1] ?? "";
+    out.push({
+      seq: Number(li.match(/title="[^"]*\/(\d+)"/)?.[1] ?? 0),
+      type: Number(rwsExtract(li, "msgtype")) || 0,
+      code: Number(rwsExtract(li, "code")) || 0,
+      timestamp: rwsExtract(li, "tstamp"),
+      title: rwsExtract(li, "title"),
+      description: rwsExtract(li, "desc"),
+    });
+  }
+  return out;
+}
+
+// Newest entries of an event log domain, newest first (at most 50). RobotWare 8 (RWS 2) pages
+// the log oldest first (order=fifo) and links the newest page as rel="last": read that page,
+// and the one before when it is not full. Without such a link the first page is used.
+export async function rwsRecentEvents(count: number, domain = 0): Promise<ElogEntry[]> {
+  const limit = Math.max(1, Math.min(50, Math.floor(count) || 10));
+  const first = await rws(`/rw/elog/${domain}?lang=en&limit=${limit}`);
+  const link = (rel: string) =>
+    first.body.match(new RegExp(`<a\\b[^>]*\\bhref="([^"]*)"[^>]*\\brel="${rel}"`))?.[1]?.replace(/&amp;/g, "&");
+  const last = link("last");
+  let entries: ElogEntry[];
+  if (last && /order=fifo/.test(last)) {
+    entries = parseElog((await rws(`/rw/elog/${last}`)).body);
+    const page = Number(last.match(/[?&]start=(\d+)/)?.[1] ?? 0);
+    if (entries.length < limit && page > 1) {
+      const previous = last.replace(/([?&]start=)\d+/, `$1${page - 1}`);
+      entries = entries.concat(parseElog((await rws(`/rw/elog/${previous}`)).body));
+    }
+  } else if (link("next")) {
+    // More pages but no usable link to the newest one: the first page may be the OLDEST entries
+    throw new Error("Event log: cannot find the page of the newest entries (no rel=\"last\" link)");
+  } else {
+    entries = parseElog(first.body);
+  }
+  if (entries.length === 0 && /elog-message-li/.test(first.body)) {
+    throw new Error("Event log: entries present but none could be read");
+  }
+  // A new event between two reads can shift the pages: keep each entry once
+  const seen = new Set<number>();
+  return entries
+    .sort((a, b) => b.seq - a.seq)
+    .filter((e) => !seen.has(e.seq) && (seen.add(e.seq), true))
+    .slice(0, limit);
+}

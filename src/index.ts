@@ -17,6 +17,7 @@ import { bridge } from "./bridge-client.js";
 import {
   rws, rwsExtract, rwsExtractAll, rwsPostForm,
   resetRwsSession, withWriteAccess, withRapidWriteAccess, rwsPostAction, RwsError,
+  rwsControllerState, rwsExecutionState, rwsProgramPointer, rwsRecentEvents, rwsIsLocal,
 } from "./rws-client.js";
 import { validateRapidCode } from "./rapid-validator.js";
 import { checkSimulationSafety, checkExecutionSafety } from "./safety-guard.js";
@@ -285,7 +286,6 @@ server.tool("rs_transform_part", "MODIFIES THE STATION. Move a whole Part rigidl
   } catch (e: any) { return err(e); } }
 );
 
-server.tool("rs_get_smartcomponent_library", "List the built-in SmartComponents (Source, Sink, LinearMover2, Attacher, LogicGate, Timer...) that rs_edit_station_logic can create with op=create + library.", {},
 // ── Physics & mechanisms ────────────────────────────────────────────────────
 
 server.tool("rs_get_physics", "Read the physics properties of one station object (name, or path 'Parent/Child' when the name is not unique): motion control (None, Static, Kinematic, Dynamic), and for a Part its physics material and collision geometry setting. Also returns the station physics settings (gravity, floor). Read-only.",
@@ -369,6 +369,7 @@ server.tool("rs_mechanism_joints", "Read the joint values, limits and named pose
   } catch (e: any) { return err(e); } }
 );
 
+server.tool("rs_get_smartcomponent_library", "List the built-in SmartComponents (Source, Sink, LinearMover2, Attacher, LogicGate, Timer...) that rs_edit_station_logic can create with op=create + library.", {},
   async () => { try { return ok(await bridge("/station/logic/library")); } catch (e: any) { return err(e); } }
 );
 
@@ -715,74 +716,257 @@ server.tool("rws_set_controller_url", "Switch RWS target controller at runtime (
 
 server.tool("rws_controller_status", "Get controller state via RWS (opmode, motors, RAPID execution)", {},
   async () => { try {
-    const [panel, opmode, exec] = await Promise.all([
-      rws("/rw/panel/ctrl-state").catch(() => rws("/rw/panel/ctrlstate")), // ctrl-state on RobotWare 8
+    const [ctrl, opmode, exec] = await Promise.all([
+      rwsControllerState(),
       rws("/rw/panel/opmode"),
-      rws("/rw/rapid/execution"),
+      rwsExecutionState(),
     ]);
     return ok({
-      controllerState: rwsExtract(panel.body, "ctrlstate") || rwsExtract(panel.body, "ctrl-state"),
+      controllerState: ctrl,
       operatingMode: rwsExtract(opmode.body, "opmode"),
-      executionState: rwsExtract(exec.body, "ctrlexecstate"),
-      cycle: rwsExtract(exec.body, "cycle"),
+      executionState: exec.state,
+      cycle: exec.cycle,
     });
   } catch (e: any) { return err(e); } }
 );
 
-server.tool("rws_set_motors", "Turn motors on/off via RWS (real controller command)",
+// ── Motors and RAPID execution (RWS) ─────────────────────────
+// RobotWare 8 (RWS 2) takes the actions in the path (/rw/rapid/execution/start) and guards
+// writes with the remote control station write access; RobotWare 6 (RWS 1) takes them as
+// ?action= and uses mastership. RobotWare 7 (RWS 2 with /rw/mastership/edit) is not supported
+// yet. rwsPostAction tries the RWS 2 form first; withRapidWriteAccess picks the access.
+
+const DEFAULT_TASK = "T_ROB1";
+// SYS_CTRL_E_PERMISSION_CONTROLLER_STATE_REJECT: "not allowed in current controller state"
+const STATE_REJECT = "-1073445806";
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function rwsErrorCode(e: any): string {
+  if (!(e instanceof RwsError)) return "";
+  return e.body.match(/class="code">\s*(-?\d+)/)?.[1] ?? e.body.match(/code=(-?\d+)/)?.[1] ?? "";
+}
+
+// Start, stop and motors are sent directly first, as ABB's own clients do. Only when the
+// controller refuses for another reason than its state (403, e.g. missing write access) is the
+// command sent again while holding write access, so a stop never waits for write access.
+async function postWithAccessFallback(rws2Path: string, rws1Path: string, params: Record<string, string>) {
+  try {
+    return await rwsPostAction(rws2Path, rws1Path, params);
+  } catch (e) {
+    // Only a refusal with an error code other than the state refusal is sent again: a refused
+    // request was not executed, and an unexplained 403 is not retried
+    const code = rwsErrorCode(e);
+    if (e instanceof RwsError && e.status === 403 && code && code !== STATE_REJECT) {
+      return withRapidWriteAccess(() => rwsPostAction(rws2Path, rws1Path, params));
+    }
+    throw e;
+  }
+}
+
+// Explains a refusal. The guard-stop text is given only for the state refusal of a start or
+// motors-on request on a local controller, and never invites the model to retry on its own.
+async function explainControllerRefusal(e: any, motorsHint = false): Promise<any> {
+  if (!(e instanceof RwsError) || (e.status !== 403 && e.status !== 400)) return e;
+  const code = rwsErrorCode(e);
+  const text = e.body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+  let hint = "";
+  if (code === STATE_REJECT) {
+    const state = await rwsControllerState().catch(() => "");
+    hint = ` The controller state does not allow it${state ? ` (state "${state}")` : ""}.`;
+    if (motorsHint && state === "guardstop") {
+      hint += " On a real controller, guard stop means a safety circuit is open.";
+      if (rwsIsLocal()) {
+        hint += " If this is a RobotStudio virtual controller, it stays in guard stop while the station" +
+          " simulation is stopped. Tell the user: they start the simulation themselves, or turn the" +
+          " motors on from the Control Panel. Starting the simulation may also start RAPID (Simulation" +
+          " Setup), so check rws_execution_state afterwards and start again only with the user's go-ahead.";
+      }
+    }
+  }
+  return new Error(`The controller refused the request (${e.status}${code ? `, code ${code}` : ""}).${hint} (${text})`);
+}
+
+server.tool("rws_set_motors", "MODIFIES THE CONTROLLER STATE: motors on enables robot motion, motors off de-energises the robot. Ask the user before turning motors on. Sent directly; sent again with write access (RobotWare 8 control station, RobotWare 6 mastership) only if the controller asks for it. A RobotStudio virtual controller in guard stop (station simulation stopped) refuses motors on.",
   { state: z.enum(["on", "off"]) },
   async ({ state }) => { try {
-    const r = await rws("POST", "/rw/panel/ctrlstate?action=setctrlstate",
-      `ctrl-state=motor${state}`, "application/x-www-form-urlencoded");
-    return ok({ result: r.status === 204 ? `Motors ${state}` : r.body });
-  } catch (e: any) { return err(e); } }
+    await postWithAccessFallback("/rw/panel/ctrl-state", "/rw/panel/ctrlstate?action=setctrlstate",
+      { "ctrl-state": `motor${state}` });
+    // The state changes asynchronously: read it for up to 2 s
+    let ctrl = "";
+    for (let i = 0; i < 8; i++) {
+      ctrl = await rwsControllerState().catch(() => "");
+      if (ctrl === `motor${state}`) break;
+      await sleep(250);
+    }
+    return ok({
+      result: `Motors ${state} requested`,
+      controllerState: ctrl || "unknown",
+      ...(ctrl === `motor${state}` ? {} : { warning: `The controller did not report motor${state} within 2 s` }),
+    });
+  } catch (e: any) { return err(await explainControllerRefusal(e, state === "on")); } }
 );
-
-// ── RAPID Execution (RWS) ────────────────────────────────────
 
 // ── rws_start_program (ENHANCED: safety guard) ──
 
-server.tool("rws_start_program", "Start RAPID execution on the controller via RWS. Blocks if errors detected — use force=true to override.",
+server.tool("rws_start_program", "MOVES THE ROBOT. Start RAPID execution from the current program pointer via RWS: place it first with rws_set_pp_routine ('PP to Routine') or rws_reset_pp, or use mode=reset. The program keeps running after the tool returns: follow it with rws_execution_state, stop it with rws_stop_program. Use cycle=once for tests. The motors must be on (a RobotStudio virtual controller is in guard stop while the station simulation is stopped). The safety check blocks the start when the motors are not on, when a program is already running, or when one of the 10 newest event log entries is an error; do not set force=true without the user's approval. RobotWare 8 and 6; RobotWare 7 not supported yet.",
   {
-    mode: z.enum(["continue", "reset"]).optional(),
-    force: z.boolean().optional().describe("Skip safety check and force start even with errors (default: false)"),
+    mode: z.enum(["continue", "reset"]).optional().describe("reset = first reset the program pointer of ALL normal tasks to main (it stays reset if the start is then refused). Default: continue from the current program pointer"),
+    cycle: z.enum(["asis", "once", "forever"]).optional().describe("Run mode: once, forever, or asis = keep the controller setting (default: asis)"),
+    waitSeconds: z.number().min(0).max(50).optional().describe("Wait up to this many seconds (max 50) for execution to end, then report the final state, program pointer and newest events (default: 0, return at once)"),
+    task: z.string().optional().describe("Task whose program pointer is reported (default: T_ROB1)"),
+    force: z.boolean().optional().describe("Skip the safety check (needs the user's approval; default: false)"),
   },
-  async ({ mode, force }) => { try {
-    if (!force) {
-      const safety = await checkExecutionSafety();
-      if (!safety.safe) {
-        return err(
-          new Error(`Safety check blocked execution: ${safety.reason}\nHint: Set force=true to override`),
-          "SafetyGuard"
-        );
+  async ({ mode, cycle, waitSeconds, task, force }) => {
+    const t = task ?? DEFAULT_TASK;
+    let ppReset = false;
+    let safetyNote = force ? "Safety check skipped (force=true)" : "";
+    try {
+      if (!force) {
+        const safety = await checkExecutionSafety();
+        if (!safety.safe) {
+          return err(
+            new Error(`Safety check blocked execution: ${safety.reason}\nHint: fix the cause; force=true only with the user's approval`),
+            "SafetyGuard"
+          );
+        }
+        safetyNote = safety.reason ?? "";
       }
+      if (mode === "reset") {
+        await withRapidWriteAccess(() => rwsPostAction(
+          "/rw/rapid/execution/resetpp", "/rw/rapid/execution?action=resetpp", {}));
+        ppReset = true;
+      }
+    } catch (e: any) {
+      return err(await explainControllerRefusal(e));
     }
-    const r = await rws("POST", "/rw/rapid/execution?action=start",
-      `regain=continue&execmode=${mode || "continue"}&cycle=forever&condition=none&stopatbp=disabled&alltaskbytsp=false`,
-      "application/x-www-form-urlencoded");
-    return ok({ result: r.status === 204 ? "Program started" : r.body });
-  } catch (e: any) { return err(e); } }
+    try {
+      await postWithAccessFallback("/rw/rapid/execution/start", "/rw/rapid/execution?action=start", {
+        regain: "continue",
+        execmode: "continue",
+        cycle: cycle ?? "asis",
+        condition: "none",
+        stopatbp: "disabled",
+        alltaskbytsp: "false",
+      });
+    } catch (e: any) {
+      const reset = ppReset ? " The program pointer had already been reset to main." : "";
+      if (!(e instanceof RwsError)) {
+        // No answer (timeout, dropped connection): the controller may have accepted the start
+        return err(new Error(`Start outcome unknown: ${e?.message ?? e}.${reset} Check rws_execution_state; do not send the start again before that.`));
+      }
+      const ex = await explainControllerRefusal(e, true);
+      return err(reset ? new Error(`${ex?.message ?? ex}${reset}`) : ex);
+    }
+
+    // The start was accepted: from here on, a failed read is reported, not raised
+    const result: Record<string, any> = { result: "Program started", safetyCheck: safetyNote };
+    const waitMs = Math.min(waitSeconds ?? 0, 50) * 1000;
+    try {
+      const t0 = Date.now();
+      let exec = await rwsExecutionState();
+      let sawRunning = exec.state === "running";
+      // The start is asynchronous: give the state up to 3 s to become "running"
+      while (!sawRunning && Date.now() - t0 < 3000) {
+        await sleep(250);
+        exec = await rwsExecutionState();
+        sawRunning = exec.state === "running";
+      }
+      while (exec.state === "running" && Date.now() - t0 < waitMs) {
+        await sleep(500);
+        exec = await rwsExecutionState();
+      }
+      result.sawRunning = sawRunning;
+      result.executionState = exec.state;
+      result.cycle = exec.cycle;
+      if (waitMs > 0) {
+        result.finished = sawRunning && exec.state === "stopped";
+        result.waitedSeconds = Math.round((Date.now() - t0) / 100) / 10;
+      }
+      if (exec.state === "running") {
+        result.note = "Running: follow it with rws_execution_state, stop it with rws_stop_program";
+      } else if (!sawRunning) {
+        result.note = "Execution was not seen running: it ended within a fraction of a second, or did" +
+          " not start. Check recentEvents and rws_execution_state; do not start again without the user's go-ahead.";
+      } else {
+        result.note = "Execution stopped: normal end, Stop instruction, error or external stop (see recentEvents)";
+      }
+      if (exec.state !== "running") {
+        result.recentEvents = (await rwsRecentEvents(5).catch(() => []))
+          .map((ev) => ({ type: ev.type, timestamp: ev.timestamp, title: ev.title }));
+      }
+    } catch (e: any) {
+      result.executionState = "unknown";
+      result.warning = `Started, but the execution state could not be read: ${e?.message ?? e}`;
+    }
+    result.programPointer = await rwsProgramPointer(t).catch(() => null);
+    return ok(result);
+  }
 );
 
-server.tool("rws_stop_program", "Stop RAPID execution via RWS", {},
+server.tool("rws_stop_program", "MODIFIES THE EXECUTION STATE. Stop RAPID execution via RWS (normal program stop, not a safety stop). Sent directly; sent again with write access (RobotWare 8 control station, RobotWare 6 mastership) only if the controller asks for it.", {},
   async () => { try {
-    const r = await rws("POST", "/rw/rapid/execution?action=stop",
-      "stopmode=stop&usetsp=normal", "application/x-www-form-urlencoded");
-    return ok({ result: r.status === 204 ? "Program stopped" : r.body });
-  } catch (e: any) { return err(e); } }
+    await postWithAccessFallback("/rw/rapid/execution/stop", "/rw/rapid/execution?action=stop",
+      { stopmode: "stop", usetsp: "normal" });
+    let exec = await rwsExecutionState().catch(() => ({ state: "unknown", cycle: "" }));
+    // The stop is asynchronous: read the state for up to 2 s
+    for (let i = 0; i < 8 && exec.state === "running"; i++) {
+      await sleep(250);
+      exec = await rwsExecutionState().catch(() => ({ state: "unknown", cycle: "" }));
+    }
+    return ok({
+      result: "Stop requested",
+      executionState: exec.state,
+      stopped: exec.state === "stopped",
+      ...(exec.state === "stopped" ? {} : {
+        warning: "Execution is not reported stopped after 2 s: check rws_execution_state; if the robot must stop now, use the FlexPendant or the emergency stop",
+      }),
+    });
+  } catch (e: any) { return err(await explainControllerRefusal(e)); } }
 );
 
-server.tool("rws_reset_pp", "Reset RAPID program pointer via RWS", {},
-  async () => { try {
-    const r = await rws("POST", "/rw/rapid/execution?action=resetpp");
-    return ok({ result: r.status === 204 ? "PP reset" : r.body });
-  } catch (e: any) { return err(e); } }
+server.tool("rws_reset_pp", "MODIFIES THE PROGRAM POINTER. Reset the program pointer of ALL normal tasks to main via RWS. Execution must be stopped. Leaving a routine that has an UNDO handler runs it. Write access: remote control station (RobotWare 8) or mastership (RobotWare 6).",
+  { task: z.string().optional().describe("Task whose new program pointer is reported (default: T_ROB1)") },
+  async ({ task }) => { try {
+    await withRapidWriteAccess(() => rwsPostAction(
+      "/rw/rapid/execution/resetpp", "/rw/rapid/execution?action=resetpp", {}));
+    return ok({ result: "PP reset", programPointer: await rwsProgramPointer(task ?? DEFAULT_TASK).catch(() => null) });
+  } catch (e: any) { return err(await explainControllerRefusal(e)); } }
 );
 
-server.tool("rws_execution_state", "Get RAPID execution state via RWS", {},
-  async () => { try {
-    const r = await rws("/rw/rapid/execution");
-    return ok({ state: rwsExtract(r.body, "ctrlexecstate"), cycle: rwsExtract(r.body, "cycle") });
+server.tool("rws_set_pp_routine", "MODIFIES THE PROGRAM POINTER. Set the program pointer of a task to the start of a routine without parameters, like 'PP to Routine', via RWS. Does not start execution (use rws_start_program). Execution must be stopped. Leaving a routine that has an UNDO handler runs it. Write access: remote control station (RobotWare 8) or mastership (RobotWare 6).",
+  {
+    task: z.string().min(1).describe("Task, e.g. 'T_ROB1'"),
+    module: z.string().min(1).describe("Module that contains the routine"),
+    routine: z.string().min(1).describe("Routine name (PROC without parameters)"),
+  },
+  async ({ task, module, routine }) => { try {
+    await withRapidWriteAccess(() => rwsPostAction(
+      `/rw/rapid/tasks/${encodeURIComponent(task)}/pcp/routine`,
+      `/rw/rapid/tasks/${encodeURIComponent(task)}/pcp?action=set-pp-routine`,
+      { routine, module, userlevel: "false" }));
+    let pp;
+    try {
+      pp = await rwsProgramPointer(task);
+    } catch (e: any) {
+      return ok({ result: "PP request accepted; the program pointer could not be read back", warning: e?.message ?? String(e) });
+    }
+    if (!pp || pp.routine.toLowerCase() !== routine.toLowerCase() || pp.module.toLowerCase() !== module.toLowerCase()) {
+      throw new Error(`The controller accepted the request but the program pointer is ${pp ? `in ${pp.module}/${pp.routine}` : "not set"}`);
+    }
+    return ok({ result: `PP set to ${pp.module}/${pp.routine}`, programPointer: pp });
+  } catch (e: any) { return err(await explainControllerRefusal(e)); } }
+);
+
+server.tool("rws_execution_state", "Get RAPID execution state, run mode and controller state via RWS, and the program pointer of a task (module, routine, line)",
+  { task: z.string().optional().describe("Task whose program pointer is reported (default: T_ROB1)") },
+  async ({ task }) => { try {
+    const exec = await rwsExecutionState();
+    return ok({
+      state: exec.state,
+      cycle: exec.cycle,
+      controllerState: await rwsControllerState().catch(() => ""),
+      programPointer: await rwsProgramPointer(task ?? DEFAULT_TASK).catch(() => null),
+    });
   } catch (e: any) { return err(e); } }
 );
 
@@ -1046,18 +1230,13 @@ server.tool("rws_set_speed_override", "Set speed override (0-100%) via RWS",
 
 // ── Event Log (RWS) ─────────────────────────────────────────
 
-server.tool("rws_event_log", "Get controller event log via RWS",
-  { count: z.number().optional().describe("Default: 10") },
+server.tool("rws_event_log", "Get the newest entries of the controller event log (common domain) via RWS, newest first. type: 1 information, 2 warning, 3 error",
+  { count: z.number().int().min(1).max(50).optional().describe("Number of entries, 1-50 (default: 10)") },
   async ({ count }) => { try {
-    const r = await rws(`/rw/elog/0?lang=en&count=${count || 10}`);
-    const titles = rwsExtractAll(r.body, "title");
-    const bodies = rwsExtractAll(r.body, "body");
-    const timestamps = rwsExtractAll(r.body, "timestamp");
-    const types = rwsExtractAll(r.body, "msgtype");
-    const entries = titles.map((t, i) => ({
-      title: t, body: bodies[i] ?? "", timestamp: timestamps[i] ?? "", type: types[i] ?? ""
-    }));
-    return ok(entries.length > 0 ? entries : { raw: r.body });
+    const entries = await rwsRecentEvents(count ?? 10);
+    return ok(entries.map((e) => ({
+      seq: e.seq, type: e.type, code: e.code, timestamp: e.timestamp, title: e.title, description: e.description,
+    })));
   } catch (e: any) { return err(e); } }
 );
 
@@ -1119,7 +1298,7 @@ async function main() {
   console.error("  SDK Bridge: " + BRIDGE_URL + " (TcpListener, no admin rights)");
   console.error("  RWS:        " + getRwsUrl() + " (runtime-switchable via rws_set_controller_url)");
   console.error("  Safety:     RAPID validation + pre-simulation error guard");
-  console.error("  Tools:      rs_* (42) + rws_* (30) = 72 total");
+  console.error("  Tools:      rs_* (51) + rws_* (32) = 83 total");
   console.error("  RULES:      NEVER run simulation if RAPID errors exist");
 }
 
