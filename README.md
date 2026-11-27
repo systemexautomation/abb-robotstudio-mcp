@@ -1,13 +1,13 @@
 # ABB RobotStudio MCP Server — LiskinLabs Edition
 
-> **v3.1.0 (Safety-First & Hardened Edition)** — Advanced MCP server for ABB RobotStudio and ABB robot controllers with TcpListener transport, 77 MCP tools, AutoLoad, RAPID syntax validator, pre-simulation safety guards, and path-traversal protection.
+> **v3.1.0 (Safety-First & Hardened Edition)** — Advanced MCP server for ABB RobotStudio and ABB robot controllers with TcpListener transport, 83 MCP tools, AutoLoad, RAPID syntax validator, pre-simulation safety guards, and path-traversal protection.
 
 Model Context Protocol (MCP) server for ABB RobotStudio (desktop application) and ABB robot controllers (OmniCore / IRC5 / Virtual Controllers).
 
-Exposes **77 tools** across two transports:
+Exposes **83 tools** across two transports:
 
-- **`rs_*`** (46 tools) — RobotStudio SDK via TcpListener in-process Add-In. Inspect/edit stations, targets, paths, modules, variables, I/O signals, configs. Drive simulation with safety guards. Capture screenshots.
-- **`rws_*`** (31 tools) — Robot Web Services REST API direct to controller. Motors, program execution, I/O signals, filesystem, mastership, event log, runtime target controller switching.
+- **`rs_*`** (51 tools) — RobotStudio SDK via TcpListener in-process Add-In. Inspect/edit stations, targets, paths, modules, variables, I/O signals, configs. Drive simulation with safety guards. Capture screenshots.
+- **`rws_*`** (32 tools) — Robot Web Services REST API direct to controller. Motors, program execution and program pointer, I/O signals, filesystem, mastership / RobotWare 8 control station write access, event log, runtime target controller switching.
 
 Tested with: **ABB RobotStudio 2026 (26.2) + Virtual Controller (RobotWare 7)** on Windows 11 x64.
 
@@ -95,9 +95,9 @@ curl http://localhost:58080/ping
 
 ---
 
-## 🛠️ Complete Tool Index (72 Tools)
+## 🛠️ Complete Tool Index (83 Tools)
 
-### SDK Tools (`rs_*`) — 46 tools
+### SDK Tools (`rs_*`) — 51 tools
 - **Connection & Status:** `rs_ping`, `rs_controller_status`, `rs_check_safety`
 - **Station Management:** `rs_get_station`, `rs_get_station_logic`, `rs_get_station_objects`, `rs_get_object_parts`, `rs_create_part_from_body`, `rs_remove_part_bodies`, `rs_set_part_frame`, `rs_create_solid_part`, `rs_modify_solid_part`, `rs_transform_part`, `rs_edit_station_logic`, `rs_get_smartcomponent_library`, `rs_list_config_signals`, `rs_create_config_signals`, `rs_save_station`, `rs_get_screenshot`
 - **RAPID Management:** `rs_get_tasks`, `rs_get_modules`, `rs_read_module`, `rs_write_module`, `rs_validate_rapid`
@@ -106,10 +106,11 @@ curl http://localhost:58080/ping
 - **Simulation Control:** `rs_start_simulation`, `rs_stop_simulation`, `rs_pause_simulation`, `rs_reset_simulation`, `rs_simulation_status`, `rs_set_sim_speed`, `rs_check_collisions`, `rs_create_collision_set`
 - **Motion & Targets:** `rs_get_position`, `rs_get_paths`, `rs_get_path_targets`, `rs_create_path`, `rs_create_target`
 - **Diagnostics & Config:** `rs_get_execution_errors`, `rs_read_config`, `rs_write_config`
+- **Physics & Mechanisms:** `rs_get_physics`, `rs_set_physics`, `rs_physics_settings`, `rs_create_mechanism`, `rs_mechanism_joints`
 
-### RWS Tools (`rws_*`) — 31 tools
+### RWS Tools (`rws_*`) — 32 tools
 - **Controller & Target:** `rws_set_controller_url`, `rws_controller_status`, `rws_restart_controller`
-- **Execution & Safety:** `rws_set_motors`, `rws_start_program`, `rws_stop_program`, `rws_reset_pp`, `rws_execution_state`, `rws_get_speed_override`, `rws_set_speed_override`
+- **Execution & Safety:** `rws_set_motors`, `rws_start_program`, `rws_stop_program`, `rws_reset_pp`, `rws_set_pp_routine`, `rws_execution_state`, `rws_get_speed_override`, `rws_set_speed_override`
 - **RAPID & Modules:** `rws_get_tasks`, `rws_get_modules`, `rws_read_module`, `rws_write_module`, `rws_load_module_from_file`, `rws_unload_module`, `rws_save_program`, `rws_load_program`
 - **Variables & I/O:** `rws_read_variable`, `rws_write_variable`, `rws_get_position`, `rws_get_io_signals`, `rws_read_io`, `rws_write_io`, `rws_create_signals`
 - **Filesystem & Logs:** `rws_list_files`, `rws_read_file`, `rws_write_file`, `rws_event_log`
